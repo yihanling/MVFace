@@ -23,23 +23,28 @@ from igmr_robotics_toolkit.util.yaml import safe_load, safe_dump, denumpy
 _log = logging.getLogger('face_scan')
 coloredlogs.install(level=logging.INFO, logger=_log)
 
-DEFAULT_CONFIG = Path(__file__).with_suffix('.yaml')
-
 
 @dataclass
 class ScanConfig:
     model: str = 'LBRmed7'
-    home_q: np.ndarray = field(default_factory=lambda: np.radians([0, 30, 0, -60, 0, 90, 0]))
+    home_q: np.ndarray = field(default_factory=lambda: np.radians([0.15, 110.29, 0, 110.03, 0, -44.99, 0]))
 
     joint_speed: float = radians(10)
     tool_speed: float = 20e-3
 
-    face: np.ndarray = field(default_factory=lambda: parse_xform('trans(0.65, 0, 0.10) rot(0, 0, -90d)'))
+    # positioned so the flange's home_q pose sits exactly on the scan sphere at
+    # azimuth=elevation=0, facing opposite the flange's home approach direction,
+    # matching the vertical base mount (arm now folds up, not out)
+    face: np.ndarray = field(default_factory=lambda: parse_xform(
+        'trans(0.147566, 0.000386, 0.832888) aa(1.761091, 1.765707, 0.726510)'))
     camera: np.ndarray = field(default_factory=lambda: np.eye(4))
 
     radius: float = 0.20
     azimuths: np.ndarray = field(default_factory=lambda: np.radians(np.linspace(-30, 30, 5)))
-    elevations: np.ndarray = field(default_factory=lambda: np.radians(np.linspace(-15, 15, 3)))
+    # +-15deg elevation is unreachable from the new folded home_q (joints 2 and 4
+    # sit within ~10deg of their limits already); +-8deg clears the whole sweep
+    # with margin to spare, verified against the real kinematics
+    elevations: np.ndarray = field(default_factory=lambda: np.radians(np.linspace(-8, 8, 3)))
 
     serpentine: bool = True
     arc_step: float = radians(5)
@@ -126,10 +131,6 @@ def subdivide(start: Tuple[float, float], end: Tuple[float, float], step: float)
     return [(start[0] + r * (end[0] - start[0]), start[1] + r * (end[1] - start[1]))
             for r in np.linspace(0, 1, n)[1:]]
 
-# ----------------------------------------------------------------------------
-# planning
-# ----------------------------------------------------------------------------
-
 @dataclass
 class ScanPlan:
     config: ScanConfig
@@ -177,6 +178,11 @@ def solve_standoff(kinematics, config: ScanConfig, angle, offset: float,
         try:
             q = kinematics.inverse_nearest(flange_pose(config, config.radius + scale * offset, angle), reference)
         except RuntimeError:
+            continue
+
+        # reject standoffs whose nearest IK solution requires too large a joint step,
+        # even though reachable, so the plan doesn't jump through a wrist/elbow flip
+        if np.linalg.norm(q - reference) > config.max_joint_step:
             continue
 
         if scale < 1:
@@ -271,19 +277,38 @@ def report(model, plan: ScanPlan) -> None:
               degrees(plan.max_joint_step), degrees(config.max_joint_step))
     _log.info('joint limit margin %s deg', np.round(np.degrees(margin), 1))
 
-def preview(model, plan: ScanPlan) -> None:
-    '''Animate the planned path with the viewpoint frames drawn in place.'''
-    from igmr_robotics_toolkit.viewer.motion import PlanViewer
-    from igmr_robotics_toolkit.viewer.widget import TransformListWidget, LineWidget
+def preview(model, controller, ptp, plan: ScanPlan, capture: Callable[[int, np.ndarray], None]) -> None:
+    '''
+    Run the scan against the controller while rendering it live, so the on-screen
+    motion is driven by the exact same trajectory generation, speed limits, and
+    settle pauses as execute() - not a separate, approximated animation.
+    '''
+    from threading import Thread
+    from igmr_robotics_toolkit.viewer.core import create_simple_viewer
+    from igmr_robotics_toolkit.viewer.widget import ControlledRobotWidget, TransformListWidget, LineWidget
 
-    viewer = PlanViewer(title='IRTk - Face Scan Preview')
-    viewer.add_path(model, plan.path, duration=max(5.0, 0.5 * plan.view_count))
+    (window, root) = create_simple_viewer(title='IRTk - Face Scan Preview')
+    ControlledRobotWidget(model=model, controller=controller, parent=root, frames=[0, model.dof])
 
     # the face frame plus every viewpoint, and the arc joining them
-    TransformListWidget(parent=viewer.root).load([plan.config.face] + list(plan.camera_poses))
-    LineWidget(parent=viewer.root).load([pose[:3, 3] for pose in plan.camera_poses])
+    TransformListWidget(parent=root).load([plan.config.face] + list(plan.camera_poses))
+    LineWidget(parent=root).load([pose[:3, 3] for pose in plan.camera_poses])
 
-    viewer.show()
+    errors = []
+
+    def run_motion():
+        try:
+            execute(model, ptp, plan, capture)
+        except PointToPointFailure as e:
+            errors.append(e)
+        finally:
+            window.userExit()
+
+    Thread(target=run_motion, daemon=True).start()
+    window.run()
+
+    if errors:
+        raise errors[0]
 
 
 def create_controller(model, config: ScanConfig, args):
@@ -385,26 +410,35 @@ def write_manifest(output: Optional[Path], plan: ScanPlan) -> None:
         )), f)
 
 def run(args):
-    config = load_config(args.config)
+    config = load_config(args.config) if args.config else ScanConfig()
     model = load_robot(config.model)
 
     plan = plan_scan(model, config)
     report(model, plan)
 
-    if args.preview:
-        preview(model, plan)
-
-    if args.plan_only:
+    if args.plan_only and not args.preview:
         return
 
-    output = Path(args.output) if args.output else None
-    write_manifest(output, plan)
+    if args.plan_only:
+        # nothing real to run against; drive the live preview off a throwaway
+        # simulator so the timing still matches a real scan
+        from igmr_robotics_toolkit.control.simulator import Simulator
+        controller = Simulator(model, q=config.home_q)
+        output = None
+    else:
+        controller = create_controller(model, config, args)
+        output = Path(args.output) if args.output else None
+        write_manifest(output, plan)
 
-    controller = create_controller(model, config, args)
     with connected(model, controller, config) as ptp:
+        capture = make_recorder(model, plan, output)
         mark = monotonic()
-        execute(model, ptp, plan, make_recorder(model, plan, output))
-        _log.info('scan finished in %.0f s', monotonic() - mark)
+        if args.preview:
+            preview(model, controller, ptp, plan, capture)
+        else:
+            execute(model, ptp, plan, capture)
+        if not args.plan_only:
+            _log.info('scan finished in %.0f s', monotonic() - mark)
 
 def main():
     parser = ArgumentParser(description=__doc__.strip().splitlines()[0],
@@ -415,7 +449,7 @@ def main():
     group.add_argument('--robot', '-r', type=str, help='hostname or address of the robot')
     group.add_argument('--plan-only', action='store_true', help='plan the scan and exit without connecting')
 
-    parser.add_argument('--config', '-c', type=Path, default=DEFAULT_CONFIG, help='scan configuration file')
+    parser.add_argument('--config', '-c', type=Path, default=None, help='scan configuration file (defaults to the built-in ScanConfig values if omitted)')
     parser.add_argument('--preview', action='store_true', help='animate the planned path in the 3D viewer')
     parser.add_argument('--output', '-o', type=str, help='directory to record per-view data into')
     parser.add_argument('--payload', type=float, default=0, help='tool payload in kg (hardware only)')
