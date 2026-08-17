@@ -138,6 +138,23 @@ def subdivide(start: Tuple[float, float], end: Tuple[float, float], step: float)
     return [(start[0] + r * (end[0] - start[0]), start[1] + r * (end[1] - start[1]))
             for r in np.linspace(0, 1, n)[1:]]
 
+def chain_joint_path(q0: np.ndarray, q1: np.ndarray, max_step: float) -> List[np.ndarray]:
+    '''Break a joint-space move into steps no larger than max_step, q1 inclusive.
+
+    Used for the home<->approach and retreat<->home legs, which (unlike the
+    Cartesian sweep) have no IK to walk through - they can require a large
+    single joint move (e.g. a redundant wrist spin) if left as one step,
+    which both looks stuck (little visible Cartesian motion) and fails the
+    per-step joint tolerance check that the rest of the path is held to.
+
+    Distance is the Euclidean norm across joints, matching check_joint_path's
+    tolerance metric (not the max-abs-single-joint metric used elsewhere for
+    speed limiting), so every step this produces is guaranteed to validate.
+    '''
+    distance = np.linalg.norm(q1 - q0)
+    n = max(2, ceil(distance / max_step) + 1)
+    return [q0 + r * (q1 - q0) for r in np.linspace(0, 1, n)[1:]]
+
 @dataclass
 class ScanPlan:
     config: ScanConfig
@@ -158,8 +175,21 @@ class ScanPlan:
 
     @property
     def path(self) -> np.ndarray:
-        '''The whole scan as one joint path, for validation and preview.'''
-        return np.concatenate([[self.approach_q]] + self.segments + [[self.retreat_q]])
+        '''The whole scan as one joint path, for validation and preview.
+
+        Includes the home_q legs at both ends: the robot actually moves
+        home -> approach -> ... -> retreat -> home, and a branch whose
+        approach_q sits on a different IK configuration than home_q pays for
+        it with a large, mostly-invisible wrist spin on that first/last leg.
+        Leaving those legs out let plan_scan pick a branch that looked smooth
+        internally but was not smooth end to end. Those legs are subdivided
+        with chain_joint_path so a large spin still passes the per-step
+        joint tolerance check below, the same way the sweep's own arcs do.
+        '''
+        home_to_approach = chain_joint_path(self.config.home_q, self.approach_q, self.config.max_joint_step)
+        retreat_to_home = chain_joint_path(self.retreat_q, self.config.home_q, self.config.max_joint_step)
+        return np.concatenate(
+            [[self.config.home_q], home_to_approach] + self.segments + [[self.retreat_q], retreat_to_home])
 
     @property
     def max_joint_step(self) -> float:
@@ -290,10 +320,15 @@ class ScanProgram(ProgramBase):
     goal_q analytically from elapsed time and streams it straight to ctrl.servo()
     every control tick, instead of handing a pre-generated trajectory to PointToPoint.
 
-    Waypoint-to-waypoint motion uses a cycloidal ease (zero velocity and
-    acceleration at both ends, like a single arch of a sine wave) so consecutive
-    holds don't produce a velocity step, with duration chosen so peak joint speed
-    never exceeds config.joint_speed.
+    Waypoints are grouped into moves that only stop where the plan actually needs
+    a stop: home, the approach standoff, each captured view, the retreat standoff.
+    The arc-subdivision waypoints within a move (added by chain()/subdivide() to
+    keep IK continuous) are blended through at speed rather than each getting its
+    own stop-start, so the arm sweeps each arc in one continuous motion. Within a
+    move, progress follows a cycloidal ease (zero velocity and acceleration at
+    both ends, like a single arch of a sine wave) over the move's total joint-space
+    path length, with duration chosen so peak joint speed never exceeds
+    config.joint_speed.
     '''
     def __init__(self, plan: ScanPlan, capture: Callable[[int, np.ndarray], None], **kwargs):
         self._plan = plan
@@ -303,10 +338,13 @@ class ScanProgram(ProgramBase):
         self.reset(None)
 
     def reset(self, ctrl: 'ControllerBase'):
-        self._waypoints = self._build_waypoints()
+        self._moves = self._build_moves()
         self._index: Optional[int] = None
         self._seg_t0 = None
-        self._seg_q0 = None
+        self._move_qs = None
+        self._move_cum = None
+        self._move_total = None
+        self._move_duration = None
         self._settle_until = None
 
         self.finished = False
@@ -314,10 +352,15 @@ class ScanProgram(ProgramBase):
 
     def _build_waypoints(self) -> List[dict]:
         config = self._plan.config
-        waypoints = [
-            dict(q=config.home_q, label='moving to home', capture=None),
-            dict(q=self._plan.approach_q, label='approaching the first viewpoint', capture=None),
-        ]
+        waypoints = [dict(q=config.home_q, label='moving to home', capture=None)]
+
+        # home -> approach can require a large redundant joint move (e.g. a
+        # wrist spin) with no Cartesian counterpart; subdivide it like a
+        # sweep arc so it's one continuous blended move, not one giant step
+        home_to_approach = chain_joint_path(config.home_q, self._plan.approach_q, config.max_joint_step)
+        for q in home_to_approach[:-1]:
+            waypoints.append(dict(q=q, label=None, capture=None))
+        waypoints.append(dict(q=home_to_approach[-1], label='approaching the first viewpoint', capture=None))
 
         for (idx, segment) in enumerate(self._plan.segments):
             (azimuth, elevation) = self._plan.angles[idx]
@@ -328,57 +371,86 @@ class ScanProgram(ProgramBase):
                 f'elevation {degrees(elevation):+6.1f} deg')))
 
         waypoints.append(dict(q=self._plan.retreat_q, label='retreating from the face', capture=None))
-        waypoints.append(dict(q=config.home_q, label='returning home', capture=None))
+
+        retreat_to_home = chain_joint_path(self._plan.retreat_q, config.home_q, config.max_joint_step)
+        for q in retreat_to_home[:-1]:
+            waypoints.append(dict(q=q, label=None, capture=None))
+        waypoints.append(dict(q=retreat_to_home[-1], label='returning home', capture=None))
         return waypoints
+
+    def _build_moves(self) -> List[List[dict]]:
+        '''Group flat waypoints into runs that stop only at the last (labeled) entry.'''
+        moves = []
+        current = []
+        for wp in self._build_waypoints():
+            current.append(wp)
+            if wp['label'] is not None:
+                moves.append(current)
+                current = []
+        return moves
 
     def _enter(self, index: int, state: 'RobotState'):
         self._index = index
         self._seg_t0 = state.timestamp
-        self._seg_q0 = state.actual_q
         self._settle_until = None
 
-        label = self._waypoints[index]['label']
+        move = self._moves[index]
+        self._move_qs = [state.actual_q] + [wp['q'] for wp in move]
+        step_dist = np.max(np.abs(np.diff(self._move_qs, axis=0)), axis=1)
+        self._move_cum = np.concatenate([[0.0], np.cumsum(step_dist)])
+        self._move_total = self._move_cum[-1]
+        self._move_duration = max(2 * self._move_total / self._plan.config.joint_speed, 1e-6)
+
+        label = move[-1]['label']
         if label:
             _log.info(label)
 
     def _advance(self, state: 'RobotState'):
-        if self._index + 1 >= len(self._waypoints):
+        if self._index + 1 >= len(self._moves):
             self.finished = True
             _log.info('scan finished')
         else:
             self._enter(self._index + 1, state)
 
+    def _interpolate(self, distance: float) -> np.ndarray:
+        '''Position along this move's polyline at the given cumulative path distance.'''
+        if self._move_total <= 0:
+            return self._move_qs[-1]
+
+        idx = min(max(int(np.searchsorted(self._move_cum, distance)), 1), len(self._move_cum) - 1)
+        (lo, hi) = (self._move_cum[idx - 1], self._move_cum[idx])
+        local_s = 0.0 if hi <= lo else (distance - lo) / (hi - lo)
+        return self._move_qs[idx - 1] + local_s * (self._move_qs[idx] - self._move_qs[idx - 1])
+
     def update(self, ctrl: 'ControllerBase', state: 'RobotState'):
         if self._index is None:
             self._enter(0, state)
 
-        wp = self._waypoints[self._index]
+        move = self._moves[self._index]
+        final = move[-1]
 
         if self.finished:
-            ctrl.servo(q=wp['q'])
-            goal_q = wp['q']
+            ctrl.servo(q=final['q'])
+            goal_q = final['q']
 
         elif self._settle_until is not None:
             # let the arm settle before recording, so the image is not smeared
-            ctrl.servo(q=wp['q'])
-            goal_q = wp['q']
+            ctrl.servo(q=final['q'])
+            goal_q = final['q']
 
             if state.timestamp >= self._settle_until:
-                self._capture(wp['capture'], state.actual_q)
+                self._capture(final['capture'], state.actual_q)
                 self._advance(state)
         else:
             t = state.timestamp - self._seg_t0
-            distance = np.max(np.abs(wp['q'] - self._seg_q0))
-            duration = max(2 * distance / self._plan.config.joint_speed, 1e-6)
-
-            s = min(t / duration, 1.0)
+            s = min(t / self._move_duration, 1.0)
             ease = s - sin(2 * pi * s) / (2 * pi)
-            goal_q = self._seg_q0 + ease * (wp['q'] - self._seg_q0)
+            goal_q = self._interpolate(ease * self._move_total)
 
             ctrl.servo(q=goal_q)
 
             if s >= 1.0:
-                if wp['capture'] is not None:
+                if final['capture'] is not None:
                     self._settle_until = state.timestamp + self._plan.config.settle_time
                 else:
                     self._advance(state)
@@ -396,6 +468,12 @@ def preview(model, ctrl: 'ControllerBase', plan: ScanPlan, capture: Callable[[in
     from igmr_robotics_toolkit.viewer.widget import ControlledRobotWidget, TransformListWidget, LineWidget
 
     (window, root) = create_simple_viewer(title='IRTk - Face Scan Preview')
+
+    # ControlledRobotWidget only snaps the mesh to the controller's actual_q on
+    # its first per-frame sync task; until then it renders at the model's raw,
+    # unposed (zero-joint) layout. Pose it to home_q first so the very first
+    # rendered frame is already right, instead of a flash at the wrong pose.
+    model.pose(plan.config.home_q)
     ControlledRobotWidget(model=model, controller=ctrl, parent=root, frames=[0, model.dof])
 
     # the face frame plus every viewpoint, and the arc joining them
