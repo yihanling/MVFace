@@ -1,27 +1,34 @@
 import logging
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from math import ceil, cos, sin, degrees, radians
+from math import ceil, cos, pi, sin, degrees, radians
 from pathlib import Path
+from threading import Thread
 from time import monotonic, sleep
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 import coloredlogs
 
 import igmr_robotics_toolkit.util.default_logging
 
-from igmr_robotics_toolkit.control.simple import PointToPoint, PointToPointFailure
+from igmr_robotics_toolkit.control.program import ProgramBase
 from igmr_robotics_toolkit.math import hinv, norm, unit
 from igmr_robotics_toolkit.motion.path import check_joint_path
 from igmr_robotics_toolkit.robot.loader import load_robot
 from igmr_robotics_toolkit.util import parse_xform
 from igmr_robotics_toolkit.util.yaml import safe_load, safe_dump, denumpy
 
+if TYPE_CHECKING:
+    from igmr_robotics_toolkit.control.controller import ControllerBase, RobotState
+
 _log = logging.getLogger('face_scan')
 coloredlogs.install(level=logging.INFO, logger=_log)
+
+# rate of the simulated servo loop; the real robot's rate is fixed by its FRI
+# session and isn't controllable from here
+CONTROL_RATE = 100
 
 
 @dataclass
@@ -30,6 +37,8 @@ class ScanConfig:
     home_q: np.ndarray = field(default_factory=lambda: np.radians([0.15, 110.29, 0, 110.03, 0, -44.99, 0]))
 
     joint_speed: float = radians(10)
+    # kept for config-file compatibility; the sine.py-style servo loop below moves
+    # joint space only and does not limit Cartesian tool speed
     tool_speed: float = 20e-3
 
     # positioned so the flange's home_q pose sits exactly on the scan sphere at
@@ -42,9 +51,11 @@ class ScanConfig:
     radius: float = 0.20
     azimuths: np.ndarray = field(default_factory=lambda: np.radians(np.linspace(-30, 30, 5)))
     # +-15deg elevation is unreachable from the new folded home_q (joints 2 and 4
-    # sit within ~10deg of their limits already); +-8deg clears the whole sweep
-    # with margin to spare, verified against the real kinematics
-    elevations: np.ndarray = field(default_factory=lambda: np.radians(np.linspace(-8, 8, 3)))
+    # sit within ~10deg of their limits already, tighter on the negative side);
+    # this keeps the same 16deg span but shifted up, clearing the whole sweep
+    # with ~3x the joint-limit margin of a symmetric range, verified against
+    # the real kinematics
+    elevations: np.ndarray = field(default_factory=lambda: np.radians(np.linspace(-3, 13, 3)))
 
     serpentine: bool = True
     arc_step: float = radians(5)
@@ -54,10 +65,6 @@ class ScanConfig:
     settle_time: float = 0.25
 
     max_joint_step: float = radians(30)
-
-    @property
-    def motion_limits(self) -> dict:
-        return dict(qd_limits=self.joint_speed, tcp_linear_limit=self.tool_speed)
 
 def load_config(path: Path) -> ScanConfig:
     with open(path) as f:
@@ -277,91 +284,152 @@ def report(model, plan: ScanPlan) -> None:
               degrees(plan.max_joint_step), degrees(config.max_joint_step))
     _log.info('joint limit margin %s deg', np.round(np.degrees(margin), 1))
 
-def preview(model, controller, ptp, plan: ScanPlan, capture: Callable[[int, np.ndarray], None]) -> None:
+class ScanProgram(ProgramBase):
+    '''
+    Drives the scan the same way SineProgram drives its wiggle: update() computes
+    goal_q analytically from elapsed time and streams it straight to ctrl.servo()
+    every control tick, instead of handing a pre-generated trajectory to PointToPoint.
+
+    Waypoint-to-waypoint motion uses a cycloidal ease (zero velocity and
+    acceleration at both ends, like a single arch of a sine wave) so consecutive
+    holds don't produce a velocity step, with duration chosen so peak joint speed
+    never exceeds config.joint_speed.
+    '''
+    def __init__(self, plan: ScanPlan, capture: Callable[[int, np.ndarray], None], **kwargs):
+        self._plan = plan
+        self._capture = capture
+
+        super().__init__(**kwargs)
+        self.reset(None)
+
+    def reset(self, ctrl: 'ControllerBase'):
+        self._waypoints = self._build_waypoints()
+        self._index: Optional[int] = None
+        self._seg_t0 = None
+        self._seg_q0 = None
+        self._settle_until = None
+
+        self.finished = False
+        self.state: Optional[RobotState] = None
+
+    def _build_waypoints(self) -> List[dict]:
+        config = self._plan.config
+        waypoints = [
+            dict(q=config.home_q, label='moving to home', capture=None),
+            dict(q=self._plan.approach_q, label='approaching the first viewpoint', capture=None),
+        ]
+
+        for (idx, segment) in enumerate(self._plan.segments):
+            (azimuth, elevation) = self._plan.angles[idx]
+            for q in segment[:-1]:
+                waypoints.append(dict(q=q, label=None, capture=None))
+            waypoints.append(dict(q=segment[-1], capture=idx, label=(
+                f'view {idx + 1:2d}/{self._plan.view_count}: azimuth {degrees(azimuth):+6.1f} deg, '
+                f'elevation {degrees(elevation):+6.1f} deg')))
+
+        waypoints.append(dict(q=self._plan.retreat_q, label='retreating from the face', capture=None))
+        waypoints.append(dict(q=config.home_q, label='returning home', capture=None))
+        return waypoints
+
+    def _enter(self, index: int, state: 'RobotState'):
+        self._index = index
+        self._seg_t0 = state.timestamp
+        self._seg_q0 = state.actual_q
+        self._settle_until = None
+
+        label = self._waypoints[index]['label']
+        if label:
+            _log.info(label)
+
+    def _advance(self, state: 'RobotState'):
+        if self._index + 1 >= len(self._waypoints):
+            self.finished = True
+            _log.info('scan finished')
+        else:
+            self._enter(self._index + 1, state)
+
+    def update(self, ctrl: 'ControllerBase', state: 'RobotState'):
+        if self._index is None:
+            self._enter(0, state)
+
+        wp = self._waypoints[self._index]
+
+        if self.finished:
+            ctrl.servo(q=wp['q'])
+            goal_q = wp['q']
+
+        elif self._settle_until is not None:
+            # let the arm settle before recording, so the image is not smeared
+            ctrl.servo(q=wp['q'])
+            goal_q = wp['q']
+
+            if state.timestamp >= self._settle_until:
+                self._capture(wp['capture'], state.actual_q)
+                self._advance(state)
+        else:
+            t = state.timestamp - self._seg_t0
+            distance = np.max(np.abs(wp['q'] - self._seg_q0))
+            duration = max(2 * distance / self._plan.config.joint_speed, 1e-6)
+
+            s = min(t / duration, 1.0)
+            ease = s - sin(2 * pi * s) / (2 * pi)
+            goal_q = self._seg_q0 + ease * (wp['q'] - self._seg_q0)
+
+            ctrl.servo(q=goal_q)
+
+            if s >= 1.0:
+                if wp['capture'] is not None:
+                    self._settle_until = state.timestamp + self._plan.config.settle_time
+                else:
+                    self._advance(state)
+
+        self.state = state
+        self.state.goal_q = goal_q
+
+def preview(model, ctrl: 'ControllerBase', plan: ScanPlan, capture: Callable[[int, np.ndarray], None]) -> None:
     '''
     Run the scan against the controller while rendering it live, so the on-screen
-    motion is driven by the exact same trajectory generation, speed limits, and
-    settle pauses as execute() - not a separate, approximated animation.
+    motion is driven by the exact same ScanProgram - not a separate, approximated
+    animation.
     '''
-    from threading import Thread
     from igmr_robotics_toolkit.viewer.core import create_simple_viewer
     from igmr_robotics_toolkit.viewer.widget import ControlledRobotWidget, TransformListWidget, LineWidget
 
     (window, root) = create_simple_viewer(title='IRTk - Face Scan Preview')
-    ControlledRobotWidget(model=model, controller=controller, parent=root, frames=[0, model.dof])
+    ControlledRobotWidget(model=model, controller=ctrl, parent=root, frames=[0, model.dof])
 
     # the face frame plus every viewpoint, and the arc joining them
     TransformListWidget(parent=root).load([plan.config.face] + list(plan.camera_poses))
     LineWidget(parent=root).load([pose[:3, 3] for pose in plan.camera_poses])
 
-    errors = []
-
     def run_motion():
         try:
-            execute(model, ptp, plan, capture)
-        except PointToPointFailure as e:
-            errors.append(e)
+            execute(model, ctrl, plan, capture)
         finally:
             window.userExit()
 
     Thread(target=run_motion, daemon=True).start()
     window.run()
 
-    if errors:
-        raise errors[0]
-
 
 def create_controller(model, config: ScanConfig, args):
     if args.simulate:
         from igmr_robotics_toolkit.control.simulator import Simulator
-        return Simulator(model, q=config.home_q)
+        return Simulator(model, q=config.home_q, control_rate=CONTROL_RATE)
     else:
         return model.Controller(args.robot, model, payload=args.payload)
 
-@contextmanager
-def connected(model, controller, config: ScanConfig):
-    ptp = PointToPoint(model, controller, **config.motion_limits)
-    ptp.connect()
-    
-    try:
-        wait_until_ready(ptp)
-        yield ptp
-    finally:
-        ptp.disconnect()
+def execute(model, ctrl: 'ControllerBase', plan: ScanPlan, capture: Callable[[int, np.ndarray], None]) -> None:
+    prog = ScanProgram(plan, capture)
 
-def wait_until_ready(ptp, timeout=10):
-    '''Block until the control loop has ticked once and reported a state.'''
-    deadline = monotonic() + timeout
-    while ptp.motion_state is None:
-        if monotonic() > deadline:
-            raise TimeoutError('no robot state after connecting - is the robot reachable and in AUT mode?')
+    thread = Thread(target=lambda: ctrl.run(prog), daemon=True)
+    thread.start()
+
+    while not prog.finished:
         sleep(0.01)
 
-def execute(model, ptp, plan: ScanPlan, capture: Callable[[int, np.ndarray], None]) -> None:
-    config = plan.config
-
-    _log.info('moving to home')
-    ptp.move_joint(config.home_q)
-
-    _log.info('approaching the first viewpoint')
-    ptp.move_joint(plan.approach_q)
-
-    for (idx, segment) in enumerate(plan.segments):
-        (azimuth, elevation) = plan.angles[idx]
-        _log.info('view %2d/%d: azimuth %+6.1f deg, elevation %+6.1f deg',
-                  idx + 1, plan.view_count, degrees(azimuth), degrees(elevation))
-
-        ptp.move_joint_waypoints(list(segment))
-
-        # let the arm settle before recording, so the image is not smeared
-        sleep(config.settle_time)
-        capture(idx, ptp.motion_state.q)
-
-    _log.info('retreating from the face')
-    ptp.move_joint(plan.retreat_q)
-
-    _log.info('returning home')
-    ptp.move_joint(config.home_q)
+    ctrl.stop()
+    thread.join()
 
 def make_recorder(model, plan: ScanPlan, output: Optional[Path]) -> Callable[[int, np.ndarray], None]:
     if output is None:
@@ -423,25 +491,24 @@ def run(args):
         # nothing real to run against; drive the live preview off a throwaway
         # simulator so the timing still matches a real scan
         from igmr_robotics_toolkit.control.simulator import Simulator
-        controller = Simulator(model, q=config.home_q)
+        controller = Simulator(model, q=config.home_q, control_rate=CONTROL_RATE)
         output = None
     else:
         controller = create_controller(model, config, args)
         output = Path(args.output) if args.output else None
         write_manifest(output, plan)
 
-    with connected(model, controller, config) as ptp:
-        capture = make_recorder(model, plan, output)
-        mark = monotonic()
-        if args.preview:
-            preview(model, controller, ptp, plan, capture)
-        else:
-            execute(model, ptp, plan, capture)
-        if not args.plan_only:
-            _log.info('scan finished in %.0f s', monotonic() - mark)
+    capture = make_recorder(model, plan, output)
+    mark = monotonic()
+    if args.preview:
+        preview(model, controller, plan, capture)
+    else:
+        execute(model, controller, plan, capture)
+    if not args.plan_only:
+        _log.info('scan finished in %.0f s', monotonic() - mark)
 
 def main():
-    parser = ArgumentParser(description=__doc__.strip().splitlines()[0],
+    parser = ArgumentParser(description='Move a KUKA LBR arm around a phantom head to capture multi-view scan data for MVFace.',
                             formatter_class=ArgumentDefaultsHelpFormatter)
 
     group = parser.add_mutually_exclusive_group(required=True)
@@ -462,7 +529,7 @@ def main():
 
     try:
         run(args)
-    except (PlanFailure, PointToPointFailure) as e:
+    except PlanFailure as e:
         _log.error('%s', e)
         raise SystemExit(1)
 
