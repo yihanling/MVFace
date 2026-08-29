@@ -34,7 +34,7 @@ CONTROL_RATE = 100
 @dataclass
 class ScanConfig:
     model: str = 'LBRmed7'
-    home_q: np.ndarray = field(default_factory=lambda: np.radians([0.15, 110.29, 0, 110.03, 0, -44.99, 0]))
+    home_q: np.ndarray = field(default_factory=lambda: np.radians([-135, 45, 0, -90, -170, 42, 97]))
 
     joint_speed: float = radians(10)
     # kept for config-file compatibility; the sine.py-style servo loop below moves
