@@ -18,7 +18,7 @@ from igmr_robotics_toolkit.math import hinv, norm, unit
 from igmr_robotics_toolkit.motion.path import check_joint_path
 from igmr_robotics_toolkit.robot.loader import load_robot
 from igmr_robotics_toolkit.util import parse_xform
-from igmr_robotics_toolkit.util.yaml import safe_load, safe_dump, denumpy
+from igmr_robotics_toolkit.util.yaml import safe_dump, denumpy
 
 if TYPE_CHECKING:
     from igmr_robotics_toolkit.control.controller import ControllerBase, RobotState
@@ -30,80 +30,20 @@ coloredlogs.install(level=logging.INFO, logger=_log)
 # session and isn't controllable from here
 CONTROL_RATE = 100
 
-
-@dataclass
-class ScanConfig:
-    model: str = 'LBRmed7'
-    home_q: np.ndarray = field(default_factory=lambda: np.radians([-135, 45, 0, -90, -170, 42, 97]))
-
-    joint_speed: float = radians(10)
-    # kept for config-file compatibility; the sine.py-style servo loop below moves
-    # joint space only and does not limit Cartesian tool speed
-    tool_speed: float = 20e-3
-
-    # positioned so the flange's home_q pose sits exactly on the scan sphere at
-    # azimuth=elevation=0, facing opposite the flange's home approach direction,
-    # matching the vertical base mount (arm now folds up, not out)
-    face: np.ndarray = field(default_factory=lambda: parse_xform(
-        'trans(0.147566, 0.000386, 0.832888) aa(1.761091, 1.765707, 0.726510)'))
-    camera: np.ndarray = field(default_factory=lambda: np.eye(4))
-
-    radius: float = 0.20
-    azimuths: np.ndarray = field(default_factory=lambda: np.radians(np.linspace(-30, 30, 5)))
-    # +-15deg elevation is unreachable from the new folded home_q (joints 2 and 4
-    # sit within ~10deg of their limits already, tighter on the negative side);
-    # this keeps the same 16deg span but shifted up, clearing the whole sweep
-    # with ~3x the joint-limit margin of a symmetric range, verified against
-    # the real kinematics
-    elevations: np.ndarray = field(default_factory=lambda: np.radians(np.linspace(-3, 13, 3)))
-
-    serpentine: bool = True
-    arc_step: float = radians(5)
-
-    approach_offset: float = 0.05
-    retreat_offset: float = 0.15
-    settle_time: float = 0.25
-
-    max_joint_step: float = radians(30)
-
-def load_config(path: Path) -> ScanConfig:
-    with open(path) as f:
-        raw = safe_load(f)
-
-    def grid(spec):
-        (low, high, count) = spec
-        return np.radians(np.linspace(low, high, int(count)))
-
-    (robot, face, camera, scan, limits) = (raw['robot'], raw['face'], raw['camera'], raw['scan'], raw['limits'])
-
-    return ScanConfig(
-        model=robot['model'],
-        home_q=np.radians(robot['home']),
-        joint_speed=radians(robot['joint_speed']),
-        tool_speed=1e-3 * robot['tool_speed'],
-
-        face=parse_xform(face['xform']),
-        camera=parse_xform(camera['xform']),
-
-        radius=scan['radius'],
-        azimuths=grid(scan['azimuth']),
-        elevations=grid(scan['elevation']),
-        serpentine=scan['serpentine'],
-        arc_step=radians(scan['arc_step']),
-        approach_offset=scan['approach_offset'],
-        retreat_offset=scan['retreat_offset'],
-        settle_time=scan['settle_time'],
-
-        max_joint_step=radians(limits['max_joint_step']),
-    )
+# simulation and preview drive the arm this many times faster than the real
+# joint_speed, so a scan that takes ~3 min on hardware previews in ~1 min.
+# joint_speed is read in exactly one place - sizing ScanProgram's move
+# durations - so scaling it is equivalent to scaling time, and the path itself
+# is untouched. Sim timings are therefore not a prediction of hardware timings;
+# hardware runs unscaled, see run().
+SIM_SPEED_SCALE = 3.0
 
 
 def look_at(eye, target, up=(0, 0, 1)) -> np.ndarray:
- 
+    '''Pose at eye whose +z axis points at target, +y as close to up as possible.'''
     eye = np.asanyarray(eye, dtype=float)
     z = unit(np.asanyarray(target, dtype=float) - eye)
 
-   
     x = np.cross(z, np.asanyarray(up, dtype=float))
     if norm(x) < 1e-9:
         x = np.cross(z, [1, 0, 0] if abs(z[0]) < 0.9 else [0, 1, 0])
@@ -114,29 +54,235 @@ def look_at(eye, target, up=(0, 0, 1)) -> np.ndarray:
     pose[:3, 3] = eye
     return pose
 
-def view_pose(radius: float, azimuth: float, elevation: float) -> np.ndarray:
-    eye = radius * np.array([
-        cos(elevation) * sin(azimuth),
-        sin(elevation),
-        cos(elevation) * cos(azimuth),
-    ])
+def serpentine_grid(columns, rows, serpentine: bool = True) -> List[tuple]:
+    '''Row-major (column, row) pairs, with alternate rows reversed.
 
-    return look_at(eye, [0, 0, 0], up=[0, 1, 0])
+    Sweeping alternate rows in opposite directions keeps every move between
+    consecutive views short. Without it the arm flies the full width of the
+    grid back across the face at the end of every row, which is both the
+    slowest and the least useful motion in the scan.
+    '''
+    out = []
+    for (index, row) in enumerate(rows):
+        line = columns[::-1] if (serpentine and index % 2) else columns
+        out.extend((column, row) for column in line)
+    return out
 
-def view_angles(config: ScanConfig) -> List[Tuple[float, float]]:
-    angles = []
-    for (row, elevation) in enumerate(config.elevations):
-        azimuths = config.azimuths
-        if config.serpentine and row % 2:
-            azimuths = azimuths[::-1]
-        angles.extend((azimuth, elevation) for azimuth in azimuths)
-    return angles
-
-def subdivide(start: Tuple[float, float], end: Tuple[float, float], step: float) -> List[Tuple[float, float]]:
-    span = max(abs(end[0] - start[0]), abs(end[1] - start[1]))
-    n = max(2, ceil(span / step) + 1)
-    return [(start[0] + r * (end[0] - start[0]), start[1] + r * (end[1] - start[1]))
+def interpolate(start, end, span: float, max_step: float) -> List[tuple]:
+    '''Views evenly spaced from start to end, end inclusive, start excluded.'''
+    n = max(2, ceil(span / max_step) + 1)
+    return [tuple(a + r * (b - a) for (a, b) in zip(start, end))
             for r in np.linspace(0, 1, n)[1:]]
+
+
+class ScanPath:
+    '''A sequence of camera poses expressed in face coordinates.
+
+    The face frame, shared by every path:
+        +z  out of the face along its gaze, toward the robot
+        +y  the crown, up
+        +x  completes the right-handed frame
+
+    Subclasses own their own view parameterisation. Everything downstream -
+    inverse kinematics chaining, standoffs, logging, recording - goes through
+    this interface, so a third path shape means a new class here and no other
+    changes.
+    '''
+    name = 'path'
+
+    def views(self) -> List[tuple]:
+        '''Every viewpoint, in the order they are captured.'''
+        raise NotImplementedError
+
+    def pose(self, view, standoff: float = 0) -> np.ndarray:
+        '''Camera pose in face coordinates, pulled back along its own optical
+        axis by standoff metres.'''
+        raise NotImplementedError
+
+    def subdivide(self, start, end) -> List[tuple]:
+        '''Intermediate views between two neighbours, end inclusive.
+
+        The arm is servoed through these so the motion between captures follows
+        the path\'s own shape rather than cutting a joint-space chord through
+        it, and so consecutive inverse kinematics solutions stay on one branch.
+        '''
+        raise NotImplementedError
+
+    def describe(self, view) -> str:
+        raise NotImplementedError
+
+    def record(self, view) -> dict:
+        '''Path-specific fields written into each view\'s record.'''
+        raise NotImplementedError
+
+    def summary(self) -> str:
+        raise NotImplementedError
+
+
+@dataclass
+class SpherePath(ScanPath):
+    name = 'sphere'
+
+    radius: float = 0.35
+
+    # +-30 x +-20 deg is the ceiling from this placement, and a hard one: every
+    # wider combination tried failed to plan outright, not merely tightly -
+    # +-35 x +-20, +-30 x +-25 and +-40 x +-15 all have no usable branch. Within
+    # that box the sampling is a real trade, because a fourth elevation row costs
+    # most of the joint-limit room:
+    #
+    #     7 az x 3 el   21 views   margin 29.7 deg   baseline  57-122 mm
+    #     7 az x 4 el   28 views   margin 13.1 deg   baseline  57- 81 mm   <- here
+
+    azimuths: np.ndarray = field(default_factory=lambda: np.radians(np.linspace(-30, 30, 7)))
+    elevations: np.ndarray = field(default_factory=lambda: np.radians(np.linspace(-20, 20, 4)))
+
+    serpentine: bool = True
+
+    # maximum angular gap between interpolated poses along the sphere
+    arc_step: float = radians(5)
+
+    def views(self):
+        return serpentine_grid(list(self.azimuths), list(self.elevations), self.serpentine)
+
+    def pose(self, view, standoff: float = 0):
+        (azimuth, elevation) = view
+        radius = self.radius + standoff
+        eye = radius * np.array([
+            cos(elevation) * sin(azimuth),
+            sin(elevation),
+            cos(elevation) * cos(azimuth),
+        ])
+        return look_at(eye, [0, 0, 0], up=[0, 1, 0])
+
+    def subdivide(self, start, end):
+        span = max(abs(end[0] - start[0]), abs(end[1] - start[1]))
+        return interpolate(start, end, span, self.arc_step)
+
+    def describe(self, view):
+        return f'azimuth {degrees(view[0]):+6.1f} deg, elevation {degrees(view[1]):+6.1f} deg'
+
+    def record(self, view):
+        return dict(azimuth_deg=degrees(view[0]), elevation_deg=degrees(view[1]))
+
+    def summary(self):
+        return (f'{len(self.views())} views on a {1e3 * self.radius:.0f} mm sphere, '
+                f'azimuth {degrees(self.azimuths[0]):+.0f}..{degrees(self.azimuths[-1]):+.0f} deg '
+                f'x elevation {degrees(self.elevations[0]):+.0f}..{degrees(self.elevations[-1]):+.0f} deg')
+
+
+@dataclass
+class PlanePath(ScanPath):
+    name = 'plane'
+
+    # With distance == the face offset, the camera positions are the same at any
+    # offset, so pushing the phantom out changes nothing mechanically here - it
+    # only shrinks the off-axis angle. That makes extent free to choose on
+    # optics alone. A parallel array puts the face further off-axis at every
+    # step out from the centre, and the binding case is the corner view:
+    #
+    #     240 x 180  5x4  20 views  corner 23.2 deg  margin 22.8 deg
+    #     300 x 240  6x5  30 views  corner 28.8 deg  margin 19.7 deg   <- here
+    #     360 x 240  7x5  35 views  corner 31.7 deg  margin 16.7 deg
+    #     360 x 300  7x6  42 views  corner 33.8 deg  margin 16.7 deg
+    distance: float = 0.35
+    width: float = 0.30
+    height: float = 0.24
+
+    columns: int = 6
+    rows: int = 5
+
+    serpentine: bool = True
+
+    # maximum spacing between interpolated poses along the grid, metres
+    step: float = 0.03
+
+    @property
+    def us(self) -> np.ndarray:
+        return np.linspace(-self.width / 2, self.width / 2, self.columns)
+
+    @property
+    def vs(self) -> np.ndarray:
+        return np.linspace(-self.height / 2, self.height / 2, self.rows)
+
+    @property
+    def orientation(self) -> np.ndarray:
+        '''The single camera orientation every view shares: looking back down
+        the face\'s +z axis, image up aligned with the crown.'''
+        return look_at([0, 0, 1], [0, 0, 0], up=[0, 1, 0])[:3, :3]
+
+    def views(self):
+        return serpentine_grid(list(self.us), list(self.vs), self.serpentine)
+
+    def pose(self, view, standoff: float = 0):
+        (u, v) = view
+        pose = np.eye(4)
+        pose[:3, :3] = self.orientation
+        pose[:3, 3] = [u, v, self.distance + standoff]
+        return pose
+
+    def subdivide(self, start, end):
+        span = max(abs(end[0] - start[0]), abs(end[1] - start[1]))
+        return interpolate(start, end, span, self.step)
+
+    def describe(self, view):
+        return f'u {1e3 * view[0]:+6.0f} mm, v {1e3 * view[1]:+6.0f} mm'
+
+    def record(self, view):
+        return dict(u_mm=1e3 * view[0], v_mm=1e3 * view[1],
+                    off_axis_deg=degrees(np.arctan2(np.hypot(*view), self.distance)))
+
+    def summary(self):
+        baseline = 1e3 * self.width / max(self.columns - 1, 1)
+        corner = degrees(np.arctan2(np.hypot(self.width / 2, self.height / 2), self.distance))
+        return (f'{len(self.views())} views on a {1e3 * self.width:.0f} x {1e3 * self.height:.0f} mm '
+                f'grid {1e3 * self.distance:.0f} mm from the face, {baseline:.0f} mm baseline, '
+                f'face up to {corner:.1f} deg off axis')
+
+
+PATHS = dict(sphere=SpherePath, plane=PlanePath)
+
+
+@dataclass
+class ScanConfig:
+    model: str = 'LBRmed7'
+    home_q: np.ndarray = field(default_factory=lambda: np.radians([-135, 45, 0, -90, -170, 42, 97]))
+
+    # the servo loop below moves joint space only and does not limit Cartesian
+    # tool speed
+    joint_speed: float = radians(10)
+
+    # Pose of the phantom in base coordinates: +z out along its gaze toward the
+    # robot, +y the crown. Independent of home_q - measure it on the rig and set
+    # it here. Everything the paths produce is expressed relative to this frame,
+    # so this is the one number that has to match the real setup.
+    # The phantom sits 350 mm in front of the parked flange, on its approach
+    # axis, gazing back down that axis with the crown up. That is the physical
+    # arrangement: the arm parks pointing at the phantom, so this pose is a
+    # function of home_q and must be refitted whenever home_q changes - it does
+    # not follow home_q on its own.
+    #
+    # 350 mm rather than the 200 mm this started at, because 200 mm cramped both
+    # paths. It is also what both path standoffs are set to, so the park pose is
+    # each path's centre view. Moving the phantom costs the plane path nothing -
+    # with distance == offset its camera positions are identical at any offset,
+    # so only the off-axis angle changes - while the sphere gains a great deal:
+    # +-20 deg of elevation here against +-10 deg at 200 mm.
+    face: np.ndarray = field(default_factory=lambda: parse_xform(
+        'trans(-0.772811, -0.694593, 0.311667) aa(0.786692, 1.624299, 1.724041)'))
+
+    # Hand-eye transform: pose of the camera frame in flange coordinates.
+    # Identity means camera frame == flange frame, true only until the real
+    # camera is mounted and calibrated.
+    camera: np.ndarray = field(default_factory=lambda: np.eye(4))
+
+    path: ScanPath = field(default_factory=SpherePath)
+
+    approach_offset: float = 0.05
+    retreat_offset: float = 0.15
+    settle_time: float = 0.25
+
+    max_joint_step: float = radians(30)
 
 def chain_joint_path(q0: np.ndarray, q1: np.ndarray, max_step: float) -> List[np.ndarray]:
     '''Break a joint-space move into steps no larger than max_step, q1 inclusive.
@@ -158,7 +304,7 @@ def chain_joint_path(q0: np.ndarray, q1: np.ndarray, max_step: float) -> List[np
 @dataclass
 class ScanPlan:
     config: ScanConfig
-    angles: List[Tuple[float, float]]
+    views: List[tuple]
 
     camera_poses: List[np.ndarray]
 
@@ -171,7 +317,7 @@ class ScanPlan:
 
     @property
     def view_count(self) -> int:
-        return len(self.angles)
+        return len(self.views)
 
     @property
     def path(self) -> np.ndarray:
@@ -195,12 +341,35 @@ class ScanPlan:
     def max_joint_step(self) -> float:
         return np.linalg.norm(np.diff(self.path, axis=0), axis=1).max()
 
+    @property
+    def reconfiguration(self) -> float:
+        '''Joint travel on the two home legs, measured before subdivision.
+
+        max_joint_step is blind to this: chain_joint_path splits both home legs
+        into steps no larger than config.max_joint_step, so a branch reached by
+        turning the whole arm over scores exactly the same there as one reached
+        by a small wrist roll. Ranking on max_joint_step alone therefore picked
+        whichever branch swept most smoothly, however far from home it sat.
+        '''
+        return (np.linalg.norm(self.approach_q - self.config.home_q)
+                + np.linalg.norm(self.config.home_q - self.retreat_q))
+
+    @property
+    def score(self) -> Tuple[float, float]:
+        '''Branch ranking key: reach the scan without reconfiguring first,
+        and among branches that manage it, sweep as smoothly as possible.'''
+        return (self.reconfiguration, self.max_joint_step)
+
 class PlanFailure(RuntimeError):
     pass
 
-def flange_pose(config: ScanConfig, radius: float, angle: Tuple[float, float]) -> np.ndarray:
+def camera_pose(config: ScanConfig, view, standoff: float = 0) -> np.ndarray:
+    '''Camera pose in base coordinates for a viewpoint.'''
+    return config.face @ config.path.pose(view, standoff)
+
+def flange_pose(config: ScanConfig, view, standoff: float = 0) -> np.ndarray:
     '''Flange pose in base coordinates that puts the camera at a viewpoint.'''
-    return config.face @ view_pose(radius, *angle) @ hinv(config.camera)
+    return camera_pose(config, view, standoff) @ hinv(config.camera)
 
 def solve(kinematics, pose: np.ndarray, reference: np.ndarray, what: str) -> np.ndarray:
     try:
@@ -209,11 +378,11 @@ def solve(kinematics, pose: np.ndarray, reference: np.ndarray, what: str) -> np.
         raise PlanFailure(f'no inverse kinematics solution for {what} '
                           f'at {np.round(pose[:3, 3], 3)} m: {e}') from e
 
-def solve_standoff(kinematics, config: ScanConfig, angle, offset: float,
+def solve_standoff(kinematics, config: ScanConfig, view, offset: float,
                    reference: np.ndarray, what: str) -> np.ndarray:
     for scale in [1, 0.75, 0.5, 0.25]:
         try:
-            q = kinematics.inverse_nearest(flange_pose(config, config.radius + scale * offset, angle), reference)
+            q = kinematics.inverse_nearest(flange_pose(config, view, scale * offset), reference)
         except RuntimeError:
             continue
 
@@ -228,18 +397,18 @@ def solve_standoff(kinematics, config: ScanConfig, angle, offset: float,
 
     raise PlanFailure(f'{what} is unreachable at any standoff up to {1e3 * offset:.0f} mm')
 
-def chain(kinematics, config: ScanConfig, angles, seed: np.ndarray):
+def chain(kinematics, config: ScanConfig, views, seed: np.ndarray):
     q = seed
     segments = []
 
-    for (idx, (previous, angle)) in enumerate(zip([angles[0]] + angles[:-1], angles)):
-        # walk along the sphere from the previous view to this one; the first
+    for (idx, (previous, view)) in enumerate(zip([views[0]] + views[:-1], views)):
+        # walk along the path from the previous view to this one; the first
         # view is simply where the seed already is
-        steps = [angle] if idx == 0 else subdivide(previous, angle, config.arc_step)
+        steps = [view] if idx == 0 else config.path.subdivide(previous, view)
 
         segment = []
         for step in steps:
-            q = solve(kinematics, flange_pose(config, config.radius, step), q, f'view {idx}')
+            q = solve(kinematics, flange_pose(config, step), q, f'view {idx}')
             segment.append(q)
 
         segments.append(np.asanyarray(segment))
@@ -248,11 +417,11 @@ def chain(kinematics, config: ScanConfig, angles, seed: np.ndarray):
 
 def plan_scan(model, config: ScanConfig) -> ScanPlan:
     kinematics = model.kinematics
-    angles = view_angles(config)
-    if not angles:
+    views = config.path.views()
+    if not views:
         raise PlanFailure('scan has no viewpoints')
 
-    first = flange_pose(config, config.radius, angles[0])
+    first = flange_pose(config, views[0])
     try:
         seeds = kinematics.inverse(first, config.home_q)
     except RuntimeError as e:
@@ -263,31 +432,41 @@ def plan_scan(model, config: ScanConfig) -> ScanPlan:
     best: Optional[ScanPlan] = None
     failures = []
 
-    for seed in seeds:
+    for (branch, seed) in enumerate(seeds):
         try:
-            segments = chain(kinematics, config, angles, seed)
+            segments = chain(kinematics, config, views, seed)
         except PlanFailure as e:
-            failures.append(str(e))
+            failures.append(f'branch {branch}: {e}')
             continue
 
         plan = ScanPlan(
-            config, angles,
-            camera_poses=[config.face @ view_pose(config.radius, *angle) for angle in angles],
+            config, views,
+            camera_poses=[camera_pose(config, view) for view in views],
             segments=segments,
-            approach_q=solve_standoff(kinematics, config, angles[0], config.approach_offset,
+            approach_q=solve_standoff(kinematics, config, views[0], config.approach_offset,
                                       seed, 'approach standoff'),
-            retreat_q=solve_standoff(kinematics, config, angles[-1], config.retreat_offset,
+            retreat_q=solve_standoff(kinematics, config, views[-1], config.retreat_offset,
                                      segments[-1][-1], 'retreat standoff'),
         )
 
-        if best is None or plan.max_joint_step < best.max_joint_step:
+        # validate here rather than once on the winner: a branch that fails the
+        # joint-path check should lose to one that passes, not take the whole
+        # plan down with it after being picked
+        try:
+            validate(model, plan)
+        except PlanFailure as e:
+            failures.append(f'branch {branch}: {e}')
+            continue
+
+        if best is None or plan.score < best.score:
             best = plan
 
     if best is None:
-        raise PlanFailure('no reachable branch for this scan:\n  ' + '\n  '.join(failures))
+        raise PlanFailure('no usable branch for this scan:\n  ' + '\n  '.join(failures))
 
-    _log.info('chose the smoothest of %d inverse kinematics branches', len(seeds))
-    validate(model, best)
+    _log.info('chose the nearest-to-home of %d inverse kinematics branches '
+              '(%.0f deg to reach the scan, largest step %.1f deg)',
+              len(seeds), degrees(best.reconfiguration), degrees(best.max_joint_step))
     return best
 
 def validate(model, plan: ScanPlan) -> None:
@@ -301,12 +480,12 @@ def report(model, plan: ScanPlan) -> None:
 
     _log.info('face at %s m, looking along %s, crown along %s',
               np.round(config.face[:3, 3], 3), np.round(config.face[:3, 2], 2), np.round(config.face[:3, 1], 2))
-    _log.info('%d views on a %.0f mm sphere, %d joint waypoints',
-              plan.view_count, 1e3 * config.radius, len(plan.path))
+    _log.info('%s path: %s', config.path.name, config.path.summary())
+    _log.info('%d joint waypoints', len(plan.path))
 
-    for (idx, (angle, pose)) in enumerate(zip(plan.angles, plan.camera_poses)):
-        _log.debug('view %2d: azimuth %+6.1f deg, elevation %+6.1f deg, camera at %s m',
-                   idx, degrees(angle[0]), degrees(angle[1]), np.round(pose[:3, 3], 3))
+    for (idx, (view, pose)) in enumerate(zip(plan.views, plan.camera_poses)):
+        _log.debug('view %2d: %s, camera at %s m',
+                   idx, config.path.describe(view), np.round(pose[:3, 3], 3))
 
     (lb, ub) = model.kinematics.limits()
     margin = np.minimum(plan.path - lb, ub - plan.path).min(axis=0)
@@ -363,12 +542,12 @@ class ScanProgram(ProgramBase):
         waypoints.append(dict(q=home_to_approach[-1], label='approaching the first viewpoint', capture=None))
 
         for (idx, segment) in enumerate(self._plan.segments):
-            (azimuth, elevation) = self._plan.angles[idx]
+            view = self._plan.views[idx]
             for q in segment[:-1]:
                 waypoints.append(dict(q=q, label=None, capture=None))
             waypoints.append(dict(q=segment[-1], capture=idx, label=(
-                f'view {idx + 1:2d}/{self._plan.view_count}: azimuth {degrees(azimuth):+6.1f} deg, '
-                f'elevation {degrees(elevation):+6.1f} deg')))
+                f'view {idx + 1:2d}/{self._plan.view_count}: '
+                f'{self._plan.config.path.describe(view)}')))
 
         waypoints.append(dict(q=self._plan.retreat_q, label='retreating from the face', capture=None))
 
@@ -520,14 +699,12 @@ def make_recorder(model, plan: ScanPlan, output: Optional[Path]) -> Callable[[in
     _log.info('recording to %s', output)
 
     def record(idx, q):
-        (azimuth, elevation) = plan.angles[idx]
         flange = model.kinematics.forward(q)
 
         entry = dict(
             view=idx,
             timestamp=datetime.now(timezone.utc).isoformat(),
-            azimuth_deg=degrees(azimuth),
-            elevation_deg=degrees(elevation),
+            **plan.config.path.record(plan.views[idx]),
             actual_q=q,
             flange_pose=flange,
             camera_pose=flange @ plan.config.camera,
@@ -548,15 +725,25 @@ def write_manifest(output: Optional[Path], plan: ScanPlan) -> None:
         safe_dump(denumpy(dict(
             started=datetime.now(timezone.utc).isoformat(),
             model=plan.config.model,
+            path=plan.config.path.name,
+            path_summary=plan.config.path.summary(),
+            path_parameters=denumpy(vars(plan.config.path)),
             face_pose=plan.config.face,
             camera_in_flange=plan.config.camera,
-            radius=plan.config.radius,
-            views=[dict(view=i, azimuth_deg=degrees(a), elevation_deg=degrees(e))
-                   for (i, (a, e)) in enumerate(plan.angles)],
+            views=[dict(view=i, **plan.config.path.record(v))
+                   for (i, v) in enumerate(plan.views)],
         )), f)
 
 def run(args):
-    config = load_config(args.config) if args.config else ScanConfig()
+    config = ScanConfig(path=PATHS[args.path]())
+
+    # only the arm has to move at the real joint_speed; planning is purely
+    # geometric and does not read it, so scaling here affects timing alone
+    if not args.robot:
+        config.joint_speed *= SIM_SPEED_SCALE
+        _log.info('simulating at %.0fx speed (%.0f deg/s)',
+                  SIM_SPEED_SCALE, degrees(config.joint_speed))
+
     model = load_robot(config.model)
 
     plan = plan_scan(model, config)
@@ -567,7 +754,7 @@ def run(args):
 
     if args.plan_only:
         # nothing real to run against; drive the live preview off a throwaway
-        # simulator so the timing still matches a real scan
+        # simulator
         from igmr_robotics_toolkit.control.simulator import Simulator
         controller = Simulator(model, q=config.home_q, control_rate=CONTROL_RATE)
         output = None
@@ -594,7 +781,10 @@ def main():
     group.add_argument('--robot', '-r', type=str, help='hostname or address of the robot')
     group.add_argument('--plan-only', action='store_true', help='plan the scan and exit without connecting')
 
-    parser.add_argument('--config', '-c', type=Path, default=None, help='scan configuration file (defaults to the built-in ScanConfig values if omitted)')
+    parser.add_argument('--path', '-p', choices=sorted(PATHS), default='sphere',
+                        help='scan path: "sphere" orbits the face at a constant standoff with every '
+                             'view aimed at it; "plane" is a rectified grid in a vertical plane with '
+                             'every view sharing one orientation')
     parser.add_argument('--preview', action='store_true', help='animate the planned path in the 3D viewer')
     parser.add_argument('--output', '-o', type=str, help='directory to record per-view data into')
     parser.add_argument('--payload', type=float, default=0, help='tool payload in kg (hardware only)')
