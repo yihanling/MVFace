@@ -26,16 +26,8 @@ if TYPE_CHECKING:
 _log = logging.getLogger('face_scan')
 coloredlogs.install(level=logging.INFO, logger=_log)
 
-# rate of the simulated servo loop; the real robot's rate is fixed by its FRI
-# session and isn't controllable from here
 CONTROL_RATE = 100
 
-# simulation and preview drive the arm this many times faster than the real
-# joint_speed, so a scan that takes ~3 min on hardware previews in ~1 min.
-# joint_speed is read in exactly one place - sizing ScanProgram's move
-# durations - so scaling it is equivalent to scaling time, and the path itself
-# is untouched. Sim timings are therefore not a prediction of hardware timings;
-# hardware runs unscaled, see run().
 SIM_SPEED_SCALE = 3.0
 
 
@@ -55,13 +47,6 @@ def look_at(eye, target, up=(0, 0, 1)) -> np.ndarray:
     return pose
 
 def serpentine_grid(columns, rows, serpentine: bool = True) -> List[tuple]:
-    '''Row-major (column, row) pairs, with alternate rows reversed.
-
-    Sweeping alternate rows in opposite directions keeps every move between
-    consecutive views short. Without it the arm flies the full width of the
-    grid back across the face at the end of every row, which is both the
-    slowest and the least useful motion in the scan.
-    '''
     out = []
     for (index, row) in enumerate(rows):
         line = columns[::-1] if (serpentine and index % 2) else columns
@@ -76,18 +61,6 @@ def interpolate(start, end, span: float, max_step: float) -> List[tuple]:
 
 
 class ScanPath:
-    '''A sequence of camera poses expressed in face coordinates.
-
-    The face frame, shared by every path:
-        +z  out of the face along its gaze, toward the robot
-        +y  the crown, up
-        +x  completes the right-handed frame
-
-    Subclasses own their own view parameterisation. Everything downstream -
-    inverse kinematics chaining, standoffs, logging, recording - goes through
-    this interface, so a third path shape means a new class here and no other
-    changes.
-    '''
     name = 'path'
 
     def views(self) -> List[tuple]:
@@ -100,12 +73,6 @@ class ScanPath:
         raise NotImplementedError
 
     def subdivide(self, start, end) -> List[tuple]:
-        '''Intermediate views between two neighbours, end inclusive.
-
-        The arm is servoed through these so the motion between captures follows
-        the path\'s own shape rather than cutting a joint-space chord through
-        it, and so consecutive inverse kinematics solutions stay on one branch.
-        '''
         raise NotImplementedError
 
     def describe(self, view) -> str:
@@ -125,22 +92,11 @@ class SpherePath(ScanPath):
 
     radius: float = 0.50
 
-    # +-20 x +-10 deg is the ceiling at this standoff, and a hard one: every
-    # wider combination fails to plan outright, at every sampling density tried
-    # (5x3, 5x4, 7x3 and 7x4 across +-20..+-35 azimuth and +-10..+-20
-    # elevation). Only +-20 x +-10 clears, at 12.8 deg of margin.
-    #
-    # This is what the 500 mm standoff costs. At 350 mm the same path reached
-    # +-30 x +-20 with 29.7 deg of margin; the orbit is simply larger here, and
-    # its extremes run out of arm. Azimuth still carries the finer sampling -
-    # sweeping horizontally is what sees the cheeks and the sides of the nose,
-    # whereas elevation mostly buys forehead and under-chin.
     azimuths: np.ndarray = field(default_factory=lambda: np.radians(np.linspace(-20, 20, 7)))
     elevations: np.ndarray = field(default_factory=lambda: np.radians(np.linspace(-10, 10, 4)))
 
     serpentine: bool = True
 
-    # maximum angular gap between interpolated poses along the sphere
     arc_step: float = radians(5)
 
     def views(self):
@@ -175,23 +131,7 @@ class SpherePath(ScanPath):
 @dataclass
 class PlanePath(ScanPath):
     name = 'plane'
-
-    # With distance == the face offset, the camera positions are the same at any
-    # offset, so pushing the phantom out changes nothing mechanically here - it
-    # only shrinks the off-axis angle, which is why this path gained from the
-    # move to 500 mm while the sphere lost. Extent is therefore chosen on optics
-    # alone. A parallel array puts the face further off-axis at every step out
-    # from the centre, and the binding case is the corner view:
-    #
-    #     300 x 240  6x5  30 views  corner 21.0 deg  margin 19.7 deg
-    #     360 x 240  7x5  35 views  corner 23.4 deg  margin 16.7 deg
-    #     360 x 300  7x6  42 views  corner 25.1 deg  margin 16.7 deg   <- here
-    #     420 x 300  8x6  48 views  corner 27.3 deg  margin 13.7 deg
-    #
-    # 25.1 deg needs a diagonal field of view above ~51 deg, which any ordinary
-    # colour camera clears - and it is a wider grid at a tighter corner angle
-    # than the 350 mm setup managed. Uniform 60 mm pitch in both directions
-    # means equal depth resolution in both, a baseline-to-depth ratio of 0.12.
+    
     distance: float = 0.50
     width: float = 0.36
     height: float = 0.30
@@ -214,8 +154,6 @@ class PlanePath(ScanPath):
 
     @property
     def orientation(self) -> np.ndarray:
-        '''The single camera orientation every view shares: looking back down
-        the face\'s +z axis, image up aligned with the crown.'''
         return look_at([0, 0, 1], [0, 0, 0], up=[0, 1, 0])[:3, :3]
 
     def views(self):
@@ -259,28 +197,9 @@ class ScanConfig:
     # tool speed
     joint_speed: float = radians(10)
 
-    # Pose of the phantom in base coordinates: +z out along its gaze toward the
-    # robot, +y the crown. Independent of home_q - measure it on the rig and set
-    # it here. Everything the paths produce is expressed relative to this frame,
-    # so this is the one number that has to match the real setup.
-    # The phantom sits 500 mm in front of the parked flange, on its approach
-    # axis, gazing back down that axis with the crown up. That is the physical
-    # arrangement: the arm parks pointing at the phantom, so this pose is a
-    # function of home_q and must be refitted whenever home_q changes - it does
-    # not follow home_q on its own.
-    #
-    # Both path standoffs match this, so the park pose is each path's centre
-    # view. The offset is not free either way: the plane path is indifferent to
-    # it (with distance == offset its camera positions are identical at any
-    # offset, so only the off-axis angle moves, and further is better), but the
-    # sphere pays for reach directly - +-30 x +-20 deg at 350 mm collapses to
-    # +-20 x +-10 deg here.
     face: np.ndarray = field(default_factory=lambda: parse_xform(
         'trans(-0.890293, -0.787428, 0.302738) aa(0.786692, 1.624299, 1.724041)'))
 
-    # Hand-eye transform: pose of the camera frame in flange coordinates.
-    # Identity means camera frame == flange frame, true only until the real
-    # camera is mounted and calibrated.
     camera: np.ndarray = field(default_factory=lambda: np.eye(4))
 
     path: ScanPath = field(default_factory=SpherePath)
@@ -292,18 +211,6 @@ class ScanConfig:
     max_joint_step: float = radians(30)
 
 def chain_joint_path(q0: np.ndarray, q1: np.ndarray, max_step: float) -> List[np.ndarray]:
-    '''Break a joint-space move into steps no larger than max_step, q1 inclusive.
-
-    Used for the home<->approach and retreat<->home legs, which (unlike the
-    Cartesian sweep) have no IK to walk through - they can require a large
-    single joint move (e.g. a redundant wrist spin) if left as one step,
-    which both looks stuck (little visible Cartesian motion) and fails the
-    per-step joint tolerance check that the rest of the path is held to.
-
-    Distance is the Euclidean norm across joints, matching check_joint_path's
-    tolerance metric (not the max-abs-single-joint metric used elsewhere for
-    speed limiting), so every step this produces is guaranteed to validate.
-    '''
     distance = np.linalg.norm(q1 - q0)
     n = max(2, ceil(distance / max_step) + 1)
     return [q0 + r * (q1 - q0) for r in np.linspace(0, 1, n)[1:]]
@@ -315,8 +222,6 @@ class ScanPlan:
 
     camera_poses: List[np.ndarray]
 
-    # joint waypoints leading to each view; the last entry of each segment is
-    # the view itself, so the robot comes to rest there
     segments: List[np.ndarray]
 
     approach_q: np.ndarray
@@ -328,17 +233,6 @@ class ScanPlan:
 
     @property
     def path(self) -> np.ndarray:
-        '''The whole scan as one joint path, for validation and preview.
-
-        Includes the home_q legs at both ends: the robot actually moves
-        home -> approach -> ... -> retreat -> home, and a branch whose
-        approach_q sits on a different IK configuration than home_q pays for
-        it with a large, mostly-invisible wrist spin on that first/last leg.
-        Leaving those legs out let plan_scan pick a branch that looked smooth
-        internally but was not smooth end to end. Those legs are subdivided
-        with chain_joint_path so a large spin still passes the per-step
-        joint tolerance check below, the same way the sweep's own arcs do.
-        '''
         home_to_approach = chain_joint_path(self.config.home_q, self.approach_q, self.config.max_joint_step)
         retreat_to_home = chain_joint_path(self.retreat_q, self.config.home_q, self.config.max_joint_step)
         return np.concatenate(
@@ -350,14 +244,6 @@ class ScanPlan:
 
     @property
     def reconfiguration(self) -> float:
-        '''Joint travel on the two home legs, measured before subdivision.
-
-        max_joint_step is blind to this: chain_joint_path splits both home legs
-        into steps no larger than config.max_joint_step, so a branch reached by
-        turning the whole arm over scores exactly the same there as one reached
-        by a small wrist roll. Ranking on max_joint_step alone therefore picked
-        whichever branch swept most smoothly, however far from home it sat.
-        '''
         return (np.linalg.norm(self.approach_q - self.config.home_q)
                 + np.linalg.norm(self.config.home_q - self.retreat_q))
 
@@ -501,21 +387,6 @@ def report(model, plan: ScanPlan) -> None:
     _log.info('joint limit margin %s deg', np.round(np.degrees(margin), 1))
 
 class ScanProgram(ProgramBase):
-    '''
-    Drives the scan the same way SineProgram drives its wiggle: update() computes
-    goal_q analytically from elapsed time and streams it straight to ctrl.servo()
-    every control tick, instead of handing a pre-generated trajectory to PointToPoint.
-
-    Waypoints are grouped into moves that only stop where the plan actually needs
-    a stop: home, the approach standoff, each captured view, the retreat standoff.
-    The arc-subdivision waypoints within a move (added by chain()/subdivide() to
-    keep IK continuous) are blended through at speed rather than each getting its
-    own stop-start, so the arm sweeps each arc in one continuous motion. Within a
-    move, progress follows a cycloidal ease (zero velocity and acceleration at
-    both ends, like a single arch of a sine wave) over the move's total joint-space
-    path length, with duration chosen so peak joint speed never exceeds
-    config.joint_speed.
-    '''
     def __init__(self, plan: ScanPlan, capture: Callable[[int, np.ndarray], None], **kwargs):
         self._plan = plan
         self._capture = capture
@@ -540,9 +411,6 @@ class ScanProgram(ProgramBase):
         config = self._plan.config
         waypoints = [dict(q=config.home_q, label='moving to home', capture=None)]
 
-        # home -> approach can require a large redundant joint move (e.g. a
-        # wrist spin) with no Cartesian counterpart; subdivide it like a
-        # sweep arc so it's one continuous blended move, not one giant step
         home_to_approach = chain_joint_path(config.home_q, self._plan.approach_q, config.max_joint_step)
         for q in home_to_approach[:-1]:
             waypoints.append(dict(q=q, label=None, capture=None))
@@ -645,20 +513,11 @@ class ScanProgram(ProgramBase):
         self.state.goal_q = goal_q
 
 def preview(model, ctrl: 'ControllerBase', plan: ScanPlan, capture: Callable[[int, np.ndarray], None]) -> None:
-    '''
-    Run the scan against the controller while rendering it live, so the on-screen
-    motion is driven by the exact same ScanProgram - not a separate, approximated
-    animation.
-    '''
     from igmr_robotics_toolkit.viewer.core import create_simple_viewer
     from igmr_robotics_toolkit.viewer.widget import ControlledRobotWidget, TransformListWidget, LineWidget
 
     (window, root) = create_simple_viewer(title='IRTk - Face Scan Preview')
 
-    # ControlledRobotWidget only snaps the mesh to the controller's actual_q on
-    # its first per-frame sync task; until then it renders at the model's raw,
-    # unposed (zero-joint) layout. Pose it to home_q first so the very first
-    # rendered frame is already right, instead of a flash at the wrong pose.
     model.pose(plan.config.home_q)
     ControlledRobotWidget(model=model, controller=ctrl, parent=root, frames=[0, model.dof])
 
