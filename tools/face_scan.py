@@ -123,19 +123,20 @@ class ScanPath:
 class SpherePath(ScanPath):
     name = 'sphere'
 
-    radius: float = 0.35
+    radius: float = 0.50
 
-    # +-30 x +-20 deg is the ceiling from this placement, and a hard one: every
-    # wider combination tried failed to plan outright, not merely tightly -
-    # +-35 x +-20, +-30 x +-25 and +-40 x +-15 all have no usable branch. Within
-    # that box the sampling is a real trade, because a fourth elevation row costs
-    # most of the joint-limit room:
+    # +-20 x +-10 deg is the ceiling at this standoff, and a hard one: every
+    # wider combination fails to plan outright, at every sampling density tried
+    # (5x3, 5x4, 7x3 and 7x4 across +-20..+-35 azimuth and +-10..+-20
+    # elevation). Only +-20 x +-10 clears, at 12.8 deg of margin.
     #
-    #     7 az x 3 el   21 views   margin 29.7 deg   baseline  57-122 mm
-    #     7 az x 4 el   28 views   margin 13.1 deg   baseline  57- 81 mm   <- here
-
-    azimuths: np.ndarray = field(default_factory=lambda: np.radians(np.linspace(-30, 30, 7)))
-    elevations: np.ndarray = field(default_factory=lambda: np.radians(np.linspace(-20, 20, 4)))
+    # This is what the 500 mm standoff costs. At 350 mm the same path reached
+    # +-30 x +-20 with 29.7 deg of margin; the orbit is simply larger here, and
+    # its extremes run out of arm. Azimuth still carries the finer sampling -
+    # sweeping horizontally is what sees the cheeks and the sides of the nose,
+    # whereas elevation mostly buys forehead and under-chin.
+    azimuths: np.ndarray = field(default_factory=lambda: np.radians(np.linspace(-20, 20, 7)))
+    elevations: np.ndarray = field(default_factory=lambda: np.radians(np.linspace(-10, 10, 4)))
 
     serpentine: bool = True
 
@@ -177,20 +178,26 @@ class PlanePath(ScanPath):
 
     # With distance == the face offset, the camera positions are the same at any
     # offset, so pushing the phantom out changes nothing mechanically here - it
-    # only shrinks the off-axis angle. That makes extent free to choose on
-    # optics alone. A parallel array puts the face further off-axis at every
-    # step out from the centre, and the binding case is the corner view:
+    # only shrinks the off-axis angle, which is why this path gained from the
+    # move to 500 mm while the sphere lost. Extent is therefore chosen on optics
+    # alone. A parallel array puts the face further off-axis at every step out
+    # from the centre, and the binding case is the corner view:
     #
-    #     240 x 180  5x4  20 views  corner 23.2 deg  margin 22.8 deg
-    #     300 x 240  6x5  30 views  corner 28.8 deg  margin 19.7 deg   <- here
-    #     360 x 240  7x5  35 views  corner 31.7 deg  margin 16.7 deg
-    #     360 x 300  7x6  42 views  corner 33.8 deg  margin 16.7 deg
-    distance: float = 0.35
-    width: float = 0.30
-    height: float = 0.24
+    #     300 x 240  6x5  30 views  corner 21.0 deg  margin 19.7 deg
+    #     360 x 240  7x5  35 views  corner 23.4 deg  margin 16.7 deg
+    #     360 x 300  7x6  42 views  corner 25.1 deg  margin 16.7 deg   <- here
+    #     420 x 300  8x6  48 views  corner 27.3 deg  margin 13.7 deg
+    #
+    # 25.1 deg needs a diagonal field of view above ~51 deg, which any ordinary
+    # colour camera clears - and it is a wider grid at a tighter corner angle
+    # than the 350 mm setup managed. Uniform 60 mm pitch in both directions
+    # means equal depth resolution in both, a baseline-to-depth ratio of 0.12.
+    distance: float = 0.50
+    width: float = 0.36
+    height: float = 0.30
 
-    columns: int = 6
-    rows: int = 5
+    columns: int = 7
+    rows: int = 6
 
     serpentine: bool = True
 
@@ -256,20 +263,20 @@ class ScanConfig:
     # robot, +y the crown. Independent of home_q - measure it on the rig and set
     # it here. Everything the paths produce is expressed relative to this frame,
     # so this is the one number that has to match the real setup.
-    # The phantom sits 350 mm in front of the parked flange, on its approach
+    # The phantom sits 500 mm in front of the parked flange, on its approach
     # axis, gazing back down that axis with the crown up. That is the physical
     # arrangement: the arm parks pointing at the phantom, so this pose is a
     # function of home_q and must be refitted whenever home_q changes - it does
     # not follow home_q on its own.
     #
-    # 350 mm rather than the 200 mm this started at, because 200 mm cramped both
-    # paths. It is also what both path standoffs are set to, so the park pose is
-    # each path's centre view. Moving the phantom costs the plane path nothing -
-    # with distance == offset its camera positions are identical at any offset,
-    # so only the off-axis angle changes - while the sphere gains a great deal:
-    # +-20 deg of elevation here against +-10 deg at 200 mm.
+    # Both path standoffs match this, so the park pose is each path's centre
+    # view. The offset is not free either way: the plane path is indifferent to
+    # it (with distance == offset its camera positions are identical at any
+    # offset, so only the off-axis angle moves, and further is better), but the
+    # sphere pays for reach directly - +-30 x +-20 deg at 350 mm collapses to
+    # +-20 x +-10 deg here.
     face: np.ndarray = field(default_factory=lambda: parse_xform(
-        'trans(-0.772811, -0.694593, 0.311667) aa(0.786692, 1.624299, 1.724041)'))
+        'trans(-0.890293, -0.787428, 0.302738) aa(0.786692, 1.624299, 1.724041)'))
 
     # Hand-eye transform: pose of the camera frame in flange coordinates.
     # Identity means camera frame == flange frame, true only until the real
