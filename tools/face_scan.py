@@ -191,14 +191,14 @@ PATHS = dict(sphere=SpherePath, plane=PlanePath)
 @dataclass
 class ScanConfig:
     model: str = 'LBRmed7'
-    home_q: np.ndarray = field(default_factory=lambda: np.radians([-135, 45, 0, -90, -170, 42, 97]))
+    home_q: np.ndarray = field(default_factory=lambda: np.radians([0, 55, 0, -90, 0, -56, 90]))
 
     # the servo loop below moves joint space only and does not limit Cartesian
     # tool speed
     joint_speed: float = radians(10)
 
     face: np.ndarray = field(default_factory=lambda: parse_xform(
-        'trans(-0.890293, -0.787428, 0.302738) aa(0.786692, 1.624299, 1.724041)'))
+        'trans(1.182996, 0.000000, 0.202695) aa(-1.148309, -1.148309, 1.247021)'))
 
     camera: np.ndarray = field(default_factory=lambda: np.eye(4))
 
