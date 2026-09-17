@@ -6,6 +6,7 @@ from math import ceil, cos, pi, sin, degrees, radians
 from pathlib import Path
 from threading import Thread
 from time import monotonic, sleep
+from types import SimpleNamespace
 from typing import Callable, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
@@ -540,7 +541,7 @@ def create_controller(model, config: ScanConfig, args):
         from igmr_robotics_toolkit.control.simulator import Simulator
         return Simulator(model, q=config.home_q, control_rate=CONTROL_RATE)
     else:
-        return model.Controller(args.robot, model, payload=args.payload)
+        return model.Controller(args.robot, model)
 
 def execute(model, ctrl: 'ControllerBase', plan: ScanPlan, capture: Callable[[int, np.ndarray], None]) -> None:
     prog = ScanProgram(plan, capture)
@@ -553,6 +554,68 @@ def execute(model, ctrl: 'ControllerBase', plan: ScanPlan, capture: Callable[[in
 
     ctrl.stop()
     thread.join()
+
+class DryRunController:
+    '''Stands in for a controller when checking a plan: tracks every servo
+    command exactly and advances a simulated clock without sleeping.'''
+
+    def __init__(self, q: np.ndarray):
+        self.q = np.array(q, dtype=float)
+
+    def servo(self, q: np.ndarray) -> None:
+        self.q = np.array(q, dtype=float)
+
+def dry_run(model, plan: ScanPlan, position_tolerance: float = 1e-3,
+            angle_tolerance: float = radians(0.1)) -> None:
+    '''Step the scan program to completion on a simulated clock and check that
+    every viewpoint is captured with the camera where the plan put it.'''
+    config = plan.config
+    captured = {}
+
+    def capture(idx, q):
+        captured[idx] = np.array(q)
+
+    prog = ScanProgram(plan, capture)
+    ctrl = DryRunController(config.home_q)
+    dt = 1 / CONTROL_RATE
+
+    # every move is eased over twice its joint distance at joint_speed, so
+    # twice the whole path plus settling is a generous bound on the scan time
+    distance = np.linalg.norm(np.diff(plan.path, axis=0), axis=1).sum()
+    budget = 2 * (2 * distance / config.joint_speed + plan.view_count * config.settle_time) + 10
+
+    tick = 0
+    while not prog.finished:
+        if tick * dt > budget:
+            raise PlanFailure(f'dry run did not finish within {budget:.0f} s of simulated time')
+        prog.update(ctrl, SimpleNamespace(timestamp=tick * dt, actual_q=ctrl.q))
+        tick += 1
+
+    missing = sorted(set(range(plan.view_count)) - set(captured))
+    if missing:
+        raise PlanFailure(f'dry run never captured views {missing}')
+
+    position_error = []
+    angle_error = []
+    for (idx, q) in sorted(captured.items()):
+        actual = model.kinematics.forward(q) @ config.camera
+        planned = plan.camera_poses[idx]
+        position_error.append(norm(actual[:3, 3] - planned[:3, 3]))
+        cos_angle = (np.trace(planned[:3, :3].T @ actual[:3, :3]) - 1) / 2
+        angle_error.append(np.arccos(np.clip(cos_angle, -1, 1)))
+
+    worst = int(np.argmax(position_error))
+    if max(position_error) > position_tolerance or max(angle_error) > angle_tolerance:
+        raise PlanFailure(f'dry run missed viewpoints: worst {1e3 * max(position_error):.3f} mm '
+                          f'(view {worst}), {degrees(max(angle_error)):.3f} deg')
+
+    if norm(ctrl.q - config.home_q) > 1e-6:
+        raise PlanFailure(f'dry run ended at {np.round(np.degrees(ctrl.q), 1)} deg instead of home')
+
+    _log.info('dry run passed: %d/%d views reached, worst error %.3f mm / %.3f deg, '
+              'scan takes %.0f s at %.0f deg/s',
+              len(captured), plan.view_count, 1e3 * max(position_error), degrees(max(angle_error)),
+              tick * dt, degrees(config.joint_speed))
 
 def make_recorder(model, plan: ScanPlan, output: Optional[Path]) -> Callable[[int, np.ndarray], None]:
     if output is None:
@@ -605,7 +668,7 @@ def run(args):
 
     # only the arm has to move at the real joint_speed; planning is purely
     # geometric and does not read it, so scaling here affects timing alone
-    if not args.robot:
+    if args.simulate:
         config.joint_speed *= SIM_SPEED_SCALE
         _log.info('simulating at %.0fx speed (%.0f deg/s)',
                   SIM_SPEED_SCALE, degrees(config.joint_speed))
@@ -615,48 +678,44 @@ def run(args):
     plan = plan_scan(model, config)
     report(model, plan)
 
-    if args.plan_only and not args.preview:
+    if args.plan_only:
+        dry_run(model, plan)
         return
 
-    if args.plan_only:
-        # nothing real to run against; drive the live preview off a throwaway
-        # simulator
-        from igmr_robotics_toolkit.control.simulator import Simulator
-        controller = Simulator(model, q=config.home_q, control_rate=CONTROL_RATE)
-        output = None
-    else:
-        controller = create_controller(model, config, args)
-        output = Path(args.output) if args.output else None
-        write_manifest(output, plan)
+    controller = create_controller(model, config, args)
+    output = Path(args.output) if args.output else None
+    write_manifest(output, plan)
 
     capture = make_recorder(model, plan, output)
     mark = monotonic()
-    if args.preview:
+    if args.simulate:
         preview(model, controller, plan, capture)
     else:
         execute(model, controller, plan, capture)
-    if not args.plan_only:
-        _log.info('scan finished in %.0f s', monotonic() - mark)
+    _log.info('scan finished in %.0f s', monotonic() - mark)
 
 def main():
     parser = ArgumentParser(description='Move a KUKA LBR arm around a phantom head to capture multi-view scan data for MVFace.',
                             formatter_class=ArgumentDefaultsHelpFormatter)
 
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--simulate', '-s', action='store_true', help='run against the built-in simulator')
+    group.add_argument('--simulate', '-s', action='store_true',
+                       help='run the scan on the built-in simulator in the 3D viewer')
     group.add_argument('--robot', '-r', type=str, help='hostname or address of the robot')
-    group.add_argument('--plan-only', action='store_true', help='plan the scan and exit without connecting')
+    group.add_argument('--plan-only', action='store_true',
+                       help='plan the scan and dry-run it headless to check every viewpoint is reached, '
+                            'without connecting or opening the viewer')
 
     parser.add_argument('--path', '-p', choices=sorted(PATHS), default='sphere',
                         help='scan path: "sphere" orbits the face at a constant standoff with every '
                              'view aimed at it; "plane" is a rectified grid in a vertical plane with '
                              'every view sharing one orientation')
-    parser.add_argument('--preview', action='store_true', help='animate the planned path in the 3D viewer')
     parser.add_argument('--output', '-o', type=str, help='directory to record per-view data into')
-    parser.add_argument('--payload', type=float, default=0, help='tool payload in kg (hardware only)')
     parser.add_argument('--verbose', '-v', action='store_true', help='log every viewpoint')
 
     args = parser.parse_args()
+    if args.plan_only and args.output:
+        parser.error('--plan-only records nothing; drop --output')
     if args.verbose:
         _log.setLevel(logging.DEBUG)
         coloredlogs.install(level=logging.DEBUG, logger=_log)
