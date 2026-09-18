@@ -46,7 +46,9 @@ def parse_args():
     p.add_argument('--epochs',    type=int,   default=150)
     p.add_argument('--bs',        type=int,   default=2)
     p.add_argument('--lr',        type=float, default=1e-4)
-    p.add_argument('--grad-clip', type=float, default=1.0)
+    p.add_argument('--grad-clip', type=float, default=1e-3)
+    p.add_argument('--lambda-2d', type=float, default=1e-4,
+                   help='weight on the 2D reprojection loss term')
     p.add_argument('--num-layers',type=int,   default=4)
     p.add_argument('--img-size',  type=int,   default=256)
     p.add_argument('--num-views', type=int,   default=5)
@@ -70,7 +72,7 @@ def nme_interocular(pred_3d, gt_3d):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, use_late_fusion):
+def evaluate(model, loader, device, use_late_fusion, lambda_2d):
     model.eval()
     loss_sum, nme_sum, mpjpe_sum, n = 0.0, 0.0, 0.0, 0
     for batch in loader:
@@ -83,7 +85,7 @@ def evaluate(model, loader, device, use_late_fusion):
         losses = decoder_losses(preds_3d, preds_2d,
                                 batch['landmarks_3d'],
                                 batch['landmarks_2d'],
-                                batch['vis'])
+                                batch['vis'], lambda_2d=lambda_2d)
         loss_sum  += float(losses['total']) * b
         nme_sum   += nme_interocular(preds_3d[-1], batch['landmarks_3d']) * b
         mpjpe_sum += float(mpjpe_mm(preds_3d[-1], batch['landmarks_3d'])) * b
@@ -160,7 +162,7 @@ def main():
             losses = decoder_losses(preds_3d, preds_2d,
                                     batch['landmarks_3d'],
                                     batch['landmarks_2d'],
-                                    batch['vis'])
+                                    batch['vis'], lambda_2d=args.lambda_2d)
             loss = losses['total']
             if not torch.isfinite(loss):
                 skipped += 1; continue
@@ -179,7 +181,8 @@ def main():
 
         if epoch % args.val_freq == 0 or epoch == args.epochs:
             val_loss, val_nme, val_mpjpe = evaluate(model, val_ld,
-                                                     args.device, use_late_fusion)
+                                                     args.device, use_late_fusion,
+                                                     args.lambda_2d)
             skip_note = f'  skipped={skipped}' if skipped else ''
             logprint(f'epoch {epoch:3d}  train_loss {train_loss:8.4f}  '
                      f'val_loss {val_loss:8.4f}  '

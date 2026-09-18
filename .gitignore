@@ -21,3 +21,5 @@ env/
 .idea/
 .DS_Store
 .claude/
+# Scratch / verification outputs
+scratch/

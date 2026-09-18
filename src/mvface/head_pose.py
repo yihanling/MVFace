@@ -25,6 +25,29 @@ import torch
 # iBUG-68 landmark groups
 RIGHT_EYE = list(range(36, 42))
 LEFT_EYE  = list(range(42, 48))
+
+# The standard iBUG-68 partition, as (name, first, last-inclusive). Used to label
+# per-joint error so a result reads "the jaw contour is worst" rather than
+# "landmarks 0, 3 and 16 are worst".
+LANDMARK_GROUPS = [
+    ("jaw",         0, 16),
+    ("right_brow", 17, 21),
+    ("left_brow",  22, 26),
+    ("nose_bridge", 27, 30),
+    ("nose_base",  31, 35),
+    ("right_eye",  36, 41),
+    ("left_eye",   42, 47),
+    ("mouth_outer", 48, 59),
+    ("mouth_inner", 60, 67),
+]
+
+
+def landmark_group(idx: int) -> str:
+    """iBUG-68 index -> group name."""
+    for name, lo, hi in LANDMARK_GROUPS:
+        if lo <= idx <= hi:
+            return name
+    return "unknown"
 # rigid, (near) expression-invariant subset for pose fitting:
 #   eye corners (36,39,42,45) + nose bridge/tip (27,28,29,30,33)
 RIGID_IDX = [36, 39, 42, 45, 27, 28, 29, 30, 33]

@@ -38,6 +38,7 @@ try:
 except ImportError:
     rs = None
 
+from mvface.units import MM_PER_METRE
 
 IMAGE_SIZE  = (256, 256)     # (Ht, Wt) — match training
 DEPTH_SCALE = 200.0          # backbone 4th-channel normalization (mm), from training
@@ -80,7 +81,7 @@ def process_view(color_bgr, depth_units, depth_scale, K, dist, R, t,
     img = cv2.undistort(img, K.astype(np.float32), dist.astype(np.float32))
 
     depth_m_full  = depth_units.astype(np.float32) * float(depth_scale)   # metres
-    depth_mm_full = depth_m_full * 1000.0                                 # mm
+    depth_mm_full = depth_m_full * MM_PER_METRE                           # mm
 
     if crop is None:
         x1, y1, x2, y2 = 0, 0, img.shape[1], img.shape[0]

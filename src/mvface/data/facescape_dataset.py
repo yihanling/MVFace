@@ -10,11 +10,46 @@ from PIL import Image
 from scipy.ndimage import binary_fill_holes
 from torch.utils.data import Dataset
 
+from mvface.units import MM_PER_METRE
+
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def denormalize_rgb(rgb_chw: torch.Tensor) -> torch.Tensor:
+    """Undo the ImageNet normalization -> displayable RGB in [0,1].
+
+    Args:
+        rgb_chw: (..., 3, H, W) normalized RGB, e.g. `sample["rgbd"][:, :3]`.
+    Returns:
+        same shape, clamped to [0, 1], safe to hand to imshow.
+    """
+    mean = torch.as_tensor(IMAGENET_MEAN, device=rgb_chw.device).view(3, 1, 1)
+    std = torch.as_tensor(IMAGENET_STD, device=rgb_chw.device).view(3, 1, 1)
+    return (rgb_chw * std + mean).clamp(0, 1)
+
 
 def _base_identity(name: str) -> str:
-    """Identity of a subject folder. Seperate from subject variants: `<id>_<variant>`
+    """Identity of a subject folder. Seperate from subject variants and
+    expressions: `<id>`, `<id>_<variant>` or `<id>_<expression>_<variant>`.
     """
     return name.split("_")[0]
+
+
+def limit_to_subjects(folder_names, n_subjects: int):
+    """A cap on subjects identities, not on item folders. 
+    """
+    if n_subjects <= 0:
+        return list(folder_names)
+    kept, seen = [], set()
+    for name in folder_names:
+        base = _base_identity(name)
+        if base not in seen:
+            if len(seen) >= n_subjects:
+                continue                  # identity past the cap: drop its items
+            seen.add(base)
+        kept.append(name)
+    return kept
 
 
 def subject_train_val_split(subject_ids, val_frac: float = 0.2, seed: int = 0):
@@ -34,17 +69,25 @@ def discover_subject_folders(root):
     """Discover all valid subject folders
     
     Returns:
-        list[str]: List of valid folder names, ordered by (subject_id, variant).
+        list[str]: List of valid folder names, ordered by
+            (subject_id, expression_id, variant_id).
     """
     root = Path(root)
     def ok(n: str) -> bool:
-        """folder only valid if the names is '<subject_id>' or '<subject_id>_<variant_id>'"""
+        """Folder is valid if its name is '<subject_id>', '<subject_id>_<variant_id>'
+        or '<subject_id>_<expression_id>_<variant_id>' -- every field all-digits.
+        """
         parts = n.split("_")
-        return len(parts) in (1, 2) and all(p.isdigit() for p in parts)
+        return len(parts) in (1, 2, 3) and all(p.isdigit() for p in parts)
     def key(n: str):
-        """sort key by subject_id, then by variant_id"""
-        parts = n.split("_")
-        return (int(parts[0]), int(parts[1]) if len(parts) == 2 else -1)
+        """sort key by subject_id, then expression_id, then variant_id
+        """
+        parts = [int(p) for p in n.split("_")]
+        if len(parts) == 1:
+            return (parts[0], -1, -1)
+        if len(parts) == 2:
+            return (parts[0], -1, parts[1])
+        return (parts[0], parts[1], parts[2])
     return sorted((d.name for d in root.iterdir() if d.is_dir() and ok(d.name)), key=key)
 
 
@@ -70,8 +113,8 @@ class MultiViewFaceScape(Dataset):
 
     ```
     rgbd          (N, 4, H, W)  RGB in [0,1] + normalized depth as the 4th channel
-    proj          (N, 3, 4)     projection matrix P = K @ [R|t] per view
-    landmarks_3d  (68, 3)       GT in the WORLD frame (shared across views)
+    proj          (N, 3, 4)     projection matrix P = K @ [R|t] per view (t in metres)
+    landmarks_3d  (68, 3)       GT in the WORLD frame, metres (shared across views)
     landmarks_2d  (N, 68, 2)    GT pixel landmarks per view
     vis           (N, 68)       per-view visibility (geometric occlusion test)
     ```
@@ -147,16 +190,24 @@ class MultiViewFaceScape(Dataset):
             # normalize depth
             depth_n = (depth - med) / self.depth_scale
 
-            # rgb is (H,W,3); transpose to (3, H, W) first and append depth_n as channel 4.
-            x = np.concatenate([rgb.transpose(2, 0, 1), depth_n[None]], axis=0).astype(np.float32)
+            # ImageNet-normalize RGB
+            rgb_n = (rgb - IMAGENET_MEAN) / IMAGENET_STD
 
-            # Build projection matrix P = K @ [R|t]. P transforms 3D coordinates into the view's 2D pixel
-            P = K @ np.hstack([R, t[:, None]])
+            # rgb is (H,W,3); transpose to (3, H, W) first and append depth_n as channel 4.
+            x = np.concatenate([rgb_n.transpose(2, 0, 1), depth_n[None]], axis=0).astype(np.float32)
+
+            # Build projection matrix P = K @ [R|t] in raw (mm) units for the consistency
+            # checks below, since lm_world/lm_cam/t are still in mm at this point.
+            P_mm = K @ np.hstack([R, t[:, None]])
 
             # assert camera -> world inverse still correct, verify R, t
             assert np.allclose((lm_cam - t) @ R, lm_world, atol=1e-3)
             # end-to-end assert world lanmarks project onto the correct pixel with P, verify P
-            assert np.allclose(_project_np(lm_world, P), uv, atol=1.0)
+            assert np.allclose(_project_np(lm_world, P_mm), uv, atol=1.0)
+
+            # Output P uses t scaled to metres to match the scaled landmarks_3d below;
+            # the perspective divide cancels the shared scale factor so pixels are unaffected.
+            P = K @ np.hstack([R, (t / MM_PER_METRE)[:, None]])
 
             # Visibility
             H, W = depth.shape
@@ -177,7 +228,7 @@ class MultiViewFaceScape(Dataset):
         sample = {
             "rgbd": torch.from_numpy(np.stack(rgbd)).float(),
             "proj": torch.from_numpy(np.stack(proj)).float(),
-            "landmarks_3d": torch.from_numpy(lm_world).float(),
+            "landmarks_3d": torch.from_numpy(lm_world / MM_PER_METRE).float(),  # mm -> m
             "landmarks_2d": torch.from_numpy(np.stack(lm2d)).float(),
             "vis": torch.from_numpy(np.stack(vis)).float(),
         }

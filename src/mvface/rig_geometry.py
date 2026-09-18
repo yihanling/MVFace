@@ -7,7 +7,7 @@ Convention:
     p3 . [X;1] = camera-space z = the metric depth used by the depth constraint.
 
 Units: keep the WORLD frame in metres
-so results land in the same frame the model was trained on (landmarks ~0.1 m, MM_PER_UNIT=1000).
+so results land in the same frame the model was trained on (landmarks ~0.1 m, see mvface.units.MM_PER_METRE).
 RealSense depth is native mm -> multiply by 1e-3 before using as `depths`.
 
 rig_calib.json format:

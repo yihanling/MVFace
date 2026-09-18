@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mvface.geometry import triangulate_dlt_batch
+from mvface.units import MM_PER_METRE
 
 
 # ── depth sampling ────────────────────────────────────────────────────────────
@@ -285,9 +286,8 @@ class MultiViewDecoder(nn.Module):
         self.query_embed = nn.Parameter(torch.empty(num_queries, d_model))
         nn.init.normal_(self.query_embed, std=0.02)
 
-        WORLD_SCALE = 1000.0  # mm -> m, must match the dataloader
-        mf = torch.as_tensor(np.asarray(mean_face), dtype=torch.float32) / WORLD_SCALE
-        sc = torch.as_tensor(np.asarray(space_center), dtype=torch.float32) / WORLD_SCALE
+        mf = torch.as_tensor(np.asarray(mean_face), dtype=torch.float32) / MM_PER_METRE
+        sc = torch.as_tensor(np.asarray(space_center), dtype=torch.float32) / MM_PER_METRE
         self.register_buffer("ref0", mf + sc)
 
         self.layers = nn.ModuleList(

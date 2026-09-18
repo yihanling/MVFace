@@ -42,6 +42,8 @@ import cv2
 import torch
 from torch.utils.data import Dataset
 
+from mvface.units import MM_PER_METRE
+
 logger = logging.getLogger(__name__)
 
 NUM_LANDMARKS      = 68
@@ -50,8 +52,7 @@ SPLIT_AT_SUBJ      = 300
 ROOT_LANDMARK      = 30
 IMAGE_SIZE         = (256, 256)   # (Ht, Wt) — pass as image_hw to model.forward
 DEPTH_SCALE        = 200.0        # for the normalized backbone channel only
-VIS_TOL_MM         = 10.0
-WORLD_SCALE        = 1000.0  # mm -> m; keeps proj well-conditioned         # depth occlusion tolerance in mm
+VIS_TOL_MM         = 10.0         # depth occlusion tolerance in mm
 
 INVALID_CAM_INDICES = {45, 46, 49, 50, 51, 52, 57}
 
@@ -160,7 +161,7 @@ def _render_depth(obj_path, cam, scale, Rt_tu):
         renderer = pyrender.OffscreenRenderer(cam['width'], cam['height'])
         _, depth = renderer.render(scene)
         renderer.delete()
-        return (depth * 1000.0).astype(np.float32)  # meters -> mm
+        return (depth * MM_PER_METRE).astype(np.float32)  # meters -> mm
     except Exception as e:
         logger.warning(f'Depth render failed: {e}')
         return np.zeros((cam['height'], cam['width']), dtype=np.float32)
@@ -388,7 +389,7 @@ class FaceScapeMultiView(Dataset):
 
         # adjusted intrinsics + true pinhole projection matrix
         Kp = _adjust_K(cam['K'], x1, y1, sx, sy)
-        t_scaled = cam['t'].reshape(3, 1) / WORLD_SCALE
+        t_scaled = cam['t'].reshape(3, 1) / MM_PER_METRE
         Rt = np.hstack([cam['R'], t_scaled])
         P_prime = (Kp @ Rt).astype(np.float32)  # (3,4) centered-world (m) -> resized px
 
@@ -421,12 +422,12 @@ class FaceScapeMultiView(Dataset):
         in_bounds = (u >= 0) & (u < Wt) & (v >= 0) & (v < Ht)
         ui = np.clip(np.round(u).astype(int), 0, Wt - 1)
         vi = np.clip(np.round(v).astype(int), 0, Ht - 1)
-        surf = depth_resized[vi, ui] / WORLD_SCALE  # mm -> m to match z_cam
+        surf = depth_resized[vi, ui] / MM_PER_METRE  # mm -> m to match z_cam
         # visible if no surface recorded there (background/hole) OR landmark is at/in front of surface
-        not_occluded = (surf <= 0) | (z_cam <= surf + VIS_TOL_MM / WORLD_SCALE)
+        not_occluded = (surf <= 0) | (z_cam <= surf + VIS_TOL_MM / MM_PER_METRE)
         vis = (in_front & in_bounds & not_occluded).astype(np.float32)
 
-        return rgbd_chw, (depth_resized / WORLD_SCALE).astype(np.float32), P_prime, lm2d, vis
+        return rgbd_chw, (depth_resized / MM_PER_METRE).astype(np.float32), P_prime, lm2d, vis
 
     def __getitem__(self, idx):
         rec = self.db[idx]
@@ -434,7 +435,7 @@ class FaceScapeMultiView(Dataset):
         joints_3d   = _tu_landmarks_scaled(rec['obj_path'], rec['scale'], rec['Rt'])
         face_center = joints_3d.mean(axis=0)
         joints_3d   = joints_3d - face_center  # per-capture centering
-        joints_3d   = joints_3d / WORLD_SCALE  # mm -> m (keeps proj well-conditioned)
+        joints_3d   = joints_3d / MM_PER_METRE  # mm -> m (keeps proj well-conditioned)
 
         all_cameras = _parse_params_json(rec['params_path'], scale_factor=rec['scale'],
                                          global_center=face_center)
@@ -457,9 +458,9 @@ class FaceScapeMultiView(Dataset):
 
         return {
             'rgbd':         torch.from_numpy(np.stack(rgbd)).float(),        # (N,4,Ht,Wt)
-            'depth_raw':    torch.from_numpy(np.stack(depth_raw)).float(),   # (N,Ht,Wt) mm (raw, NOT divided by WORLD_SCALE)
+            'depth_raw':    torch.from_numpy(np.stack(depth_raw)).float(),   # (N,Ht,Wt) mm (raw, NOT divided by MM_PER_METRE)
             'proj':         torch.from_numpy(np.stack(proj)).float(),        # (N,3,4)
-            'landmarks_3d': torch.from_numpy(joints_3d).float(),             # (68,3) m  (divided by WORLD_SCALE)
+            'landmarks_3d': torch.from_numpy(joints_3d).float(),             # (68,3) m  (divided by MM_PER_METRE)
             'landmarks_2d': torch.from_numpy(np.stack(lm2d)).float(),        # (N,68,2)
             'vis':          torch.from_numpy(np.stack(vis)).float(),         # (N,68)
         }

@@ -13,10 +13,22 @@ dependencies = [
     "pillow",
     "torch",
     "torchvision",
+    "matplotlib",   # tools/viz_pred_vs_gt.py
+]
+
+[project.optional-dependencies]
+# Data generation only (tools/render_views.py); training and eval never need it.
+# Install with:  bash setup_render.sh
+
+render = [
+    "pyrender>=0.1.45",         # offscreen GL rendering (EGL headless)
+    "trimesh",                  # textured .obj loading
+    "opencv-python-headless",   # debug overlays only
+    "tqdm",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-mvface = ["assets/*.npy", "assets/*.json"]
+mvface = ["assets/*.npy", "assets/*.npz", "assets/*.json"]

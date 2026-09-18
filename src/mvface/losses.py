@@ -3,10 +3,10 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from mvface.units import MM_PER_METRE
 
 # Landmarks are in metres (IOD ~0.105 m = ~105 mm physically).
-# Multiply by 1000 to report all metrics in mm.
-MM_PER_UNIT: float = 1000.0
+# Multiply by MM_PER_METRE to report all metrics in mm.
 
 
 def masked_l1_2d(pred: torch.Tensor, gt: torch.Tensor, vis: torch.Tensor) -> torch.Tensor:
@@ -16,7 +16,7 @@ def masked_l1_2d(pred: torch.Tensor, gt: torch.Tensor, vis: torch.Tensor) -> tor
     return diff.sum() / (m.sum() * 2 + 1e-6)
 
 
-def decoder_losses(preds_3d, preds_2d, gt_3d, gt_2d, vis, lambda_2d: float = 0.1):
+def decoder_losses(preds_3d, preds_2d, gt_3d, gt_2d, vis, lambda_2d: float = 1e-4):
     """Returns a dict with the total and each component (for logging)."""
     loss_3d = preds_3d[0].new_zeros(())
     loss_2d = preds_3d[0].new_zeros(())
@@ -28,7 +28,7 @@ def decoder_losses(preds_3d, preds_2d, gt_3d, gt_2d, vis, lambda_2d: float = 0.1
 
 
 # ---------------------------------------------------------------------------
-# Evaluation metrics — all return honest mm via MM_PER_UNIT.
+# Evaluation metrics — all return honest mm via MM_PER_METRE.
 # vis: optional (B, J) mask; None averages over all landmarks (matches how
 # nme_interocular is computed in train.py, so the two metrics are comparable).
 # ---------------------------------------------------------------------------
@@ -42,7 +42,7 @@ def _masked_mean(err: torch.Tensor, vis: torch.Tensor | None) -> torch.Tensor:
 @torch.no_grad()
 def mpjpe_mm(pred_3d: torch.Tensor, gt_3d: torch.Tensor,
              vis: torch.Tensor | None = None,
-             scale: float = MM_PER_UNIT) -> float:
+             scale: float = MM_PER_METRE) -> float:
     """Mean per-joint position error in mm."""
     err = (pred_3d - gt_3d).norm(dim=-1)              # (B, J)
     return float(_masked_mean(err, vis) * scale)
@@ -51,7 +51,7 @@ def mpjpe_mm(pred_3d: torch.Tensor, gt_3d: torch.Tensor,
 @torch.no_grad()
 def per_joint_pjpe(pred_3d: torch.Tensor, gt_3d: torch.Tensor,
                    vis: torch.Tensor | None = None,
-                   scale: float = MM_PER_UNIT) -> torch.Tensor:
+                   scale: float = MM_PER_METRE) -> torch.Tensor:
     """Per-landmark position error in mm averaged over the batch -> (J,)."""
     err = (pred_3d - gt_3d).norm(dim=-1)              # (B, J)
     if vis is None:
@@ -63,7 +63,7 @@ def per_joint_pjpe(pred_3d: torch.Tensor, gt_3d: torch.Tensor,
 @torch.no_grad()
 def p_mpjpe(pred_3d: torch.Tensor, gt_3d: torch.Tensor,
             vis: torch.Tensor | None = None,
-            scale: float = MM_PER_UNIT) -> float:
+            scale: float = MM_PER_METRE) -> float:
     """Procrustes-aligned MPJPE in mm. Removes per-sample rigid+scale transform
     before measuring error — isolates shape accuracy from global misalignment.
     A large gap vs mpjpe_mm means error is mostly pose/scale, not landmark shape."""

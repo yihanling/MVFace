@@ -53,6 +53,37 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 If this prints `False`, install a PyTorch build matching your CUDA version from
 <https://pytorch.org/get-started/locally/>, then re-run `pip install -e .`.
 
+### Rendering dependencies (data generation only)
+
+`pip install -e .` deliberately leaves out the rendering stack. It is only
+needed on a machine that renders FaceScape meshes into training data, never for
+training, evaluation or benchmarking. Install it with one command:
+
+```bash
+bash setup_render.sh              # into ./.venv
+bash setup_render.sh <path/venv>  # into another venv, e.g. on a cluster
+```
+
+That installs the `[render]` extra (pyrender, trimesh, OpenCV, tqdm), then
+upgrades PyOpenGL past pyrender's stale `PyOpenGL==3.1.0` pin, then verifies the
+result with a headless textured render.
+
+The upgrade is not optional. PyOpenGL 3.1.0 raises `ctypes.ArgumentError` inside
+`glGenTextures` on Python 3.14 as soon as a *textured* mesh is drawn; untextured
+geometry renders fine, so the failure only appears once rendering real meshes.
+`tools/render_views.py` refuses to start if it finds a version older than 3.1.9.
+
+Because we install over that pin on purpose, two things are expected and are not
+errors:
+
+- pip prints `ERROR: pip's dependency resolver ... pyrender 0.1.45 requires
+  PyOpenGL==3.1.0` during the second pass. The install still succeeds.
+- `pip check` reports that same unsatisfied requirement for the life of the
+  environment.
+
+Renders run headless through EGL, so prefix render commands with
+`PYOPENGL_PLATFORM=egl`.
+
 ## Usage
 
 ### Training

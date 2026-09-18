@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mvface.geometry import triangulate_dlt_batch
+from mvface.units import MM_PER_METRE
 
 
 class ProjectiveAttention(nn.Module):
@@ -159,8 +160,8 @@ class MultiViewDecoder(nn.Module):
         nn.init.normal_(self.query_embed, std=0.02)
 
         # 3D queries init: mean face shape centered at SPACE_CENTER.
-        mf = torch.as_tensor(np.asarray(mean_face), dtype=torch.float32)
-        sc = torch.as_tensor(np.asarray(space_center), dtype=torch.float32)
+        mf = torch.as_tensor(np.asarray(mean_face), dtype=torch.float32) / MM_PER_METRE
+        sc = torch.as_tensor(np.asarray(space_center), dtype=torch.float32) / MM_PER_METRE
         self.register_buffer("ref0", mf + sc) # register as buffer, it is never later learned and modified
 
         self.layers = nn.ModuleList(
