@@ -21,15 +21,16 @@ dependencies = [
 # Data generation only (tools/render_views.py); training and eval never need it.
 # Install with:  bash setup_render.sh
 render = [
-    "pyrender>=0.1.45",         # offscreen GL rendering (EGL headless)
-    "trimesh",                  # textured .obj loading
-    "opencv-python",            # debug overlays only
+    "pyrender>=0.1.45",
+    "trimesh",
+    "opencv-python",
     "tqdm",
 ]
 
 data_collection = [
-    "opencv-python",    # cv2.imwrite for captured frames, cv2.imshow for live preview
-    "pyrealsense2",     # RealSense camera SDK
+    "opencv-python",
+    "pyrealsense2; sys_platform != 'darwin'",         # official RealSense SDK wheels: Windows/Linux only
+    "pyrealsense2-macosx; sys_platform == 'darwin'",  # community macOS build, same `import pyrealsense2` API
 ]
 
 all = ["mvface[render,data_collection]"]
