@@ -32,6 +32,8 @@ data_collection = [
     "pyrealsense2",     # RealSense camera SDK
 ]
 
+all = ["mvface[render,data_collection]"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
