@@ -1,6 +1,7 @@
 cameras:
   d435_top:
     model: perspective
+    type: d435
     serial: '238222074486'
     rotate: 180
     resolution: [480, 270]
@@ -20,6 +21,7 @@ cameras:
 
   d435_below:
     model: perspective
+    type: d435
     serial: '238222070823'
     rotate: 180
     resolution: [480, 270]
@@ -39,6 +41,7 @@ cameras:
 
   d405_center:
     model: perspective
+    type: d405
     serial: '128422271548'
     rotate: 180
     resolution: [480, 270]
@@ -58,6 +61,7 @@ cameras:
 
   d405_right:
     model: perspective
+    type: d405
     serial: '218622273459'
     rotate: 180
     resolution: [480, 270]
@@ -77,6 +81,7 @@ cameras:
 
   d405_left:
     model: perspective
+    type: d405
     serial: '230322272744'
     rotate: 180
     resolution: [480, 270]
@@ -96,6 +101,7 @@ cameras:
 
   d405_top_left:
     model: perspective
+    type: d405
     serial: '218622272247'
     rotate: 180
     resolution: [480, 270]
@@ -115,6 +121,7 @@ cameras:
 
   d405_top_right:
     model: perspective
+    type: d405
     serial: '218622270886'
     rotate: 180
     resolution: [480, 270]
