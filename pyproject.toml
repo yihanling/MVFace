@@ -17,14 +17,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+
 # Data generation only (tools/render_views.py); training and eval never need it.
 # Install with:  bash setup_render.sh
-
 render = [
     "pyrender>=0.1.45",         # offscreen GL rendering (EGL headless)
     "trimesh",                  # textured .obj loading
-    "opencv-python-headless",   # debug overlays only
+    "opencv-python",            # debug overlays only
     "tqdm",
+]
+
+data_collection = [
+    "opencv-python",    # cv2.imwrite for captured frames, cv2.imshow for live preview
+    "pyrealsense2",     # RealSense camera SDK
 ]
 
 [tool.setuptools.packages.find]
