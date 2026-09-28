@@ -1,5 +1,7 @@
 import logging
+import shutil
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from math import ceil, cos, pi, sin, degrees, radians
@@ -23,6 +25,7 @@ from igmr_robotics_toolkit.util.yaml import safe_dump, denumpy
 
 if TYPE_CHECKING:
     from igmr_robotics_toolkit.control.controller import ControllerBase, RobotState
+    from camera import CameraRig
 
 _log = logging.getLogger('face_scan')
 coloredlogs.install(level=logging.INFO, logger=_log)
@@ -30,6 +33,10 @@ coloredlogs.install(level=logging.INFO, logger=_log)
 CONTROL_RATE = 100
 
 SIM_SPEED_SCALE = 3.0
+
+# captures land in OUTPUT_ROOT/<MM-DD-YYYY>/<experiment id>
+OUTPUT_ROOT = Path(__file__).resolve().parent / 'output'
+DATE_FORMAT = '%m-%d-%Y'
 
 
 def look_at(eye, target, up=(0, 0, 1)) -> np.ndarray:
@@ -91,7 +98,7 @@ class ScanPath:
 class SpherePath(ScanPath):
     name = 'sphere'
 
-    radius: float = 0.50
+    radius: float = 0.5
 
     azimuths: np.ndarray = field(default_factory=lambda: np.radians(np.linspace(-20, 20, 7)))
     elevations: np.ndarray = field(default_factory=lambda: np.radians(np.linspace(-10, 10, 4)))
@@ -133,7 +140,7 @@ class SpherePath(ScanPath):
 class PlanePath(ScanPath):
     name = 'plane'
     
-    distance: float = 0.50
+    distance: float = 0.30
     width: float = 0.36
     height: float = 0.30
 
@@ -387,8 +394,12 @@ def report(model, plan: ScanPlan) -> None:
               degrees(plan.max_joint_step), degrees(config.max_joint_step))
     _log.info('joint limit margin %s deg', np.round(np.degrees(margin), 1))
 
+# called once per viewpoint with the view index and joint angles; a returned Future
+# holds the arm at the view until it completes, None advances immediately
+Capture = Callable[[int, np.ndarray], Optional[Future]]
+
 class ScanProgram(ProgramBase):
-    def __init__(self, plan: ScanPlan, capture: Callable[[int, np.ndarray], None], **kwargs):
+    def __init__(self, plan: ScanPlan, capture: Capture, **kwargs):
         self._plan = plan
         self._capture = capture
 
@@ -404,6 +415,7 @@ class ScanProgram(ProgramBase):
         self._move_total = None
         self._move_duration = None
         self._settle_until = None
+        self._pending: Optional[Future] = None
 
         self.finished = False
         self.state: Optional[RobotState] = None
@@ -493,9 +505,15 @@ class ScanProgram(ProgramBase):
             ctrl.servo(q=final['q'])
             goal_q = final['q']
 
-            if state.timestamp >= self._settle_until:
-                self._capture(final['capture'], state.actual_q)
-                self._advance(state)
+            if self._pending is not None:
+                # capture runs off this control thread; keep servoing the view until it is done
+                if self._pending.done():
+                    self._pending = None
+                    self._advance(state)
+            elif state.timestamp >= self._settle_until:
+                self._pending = self._capture(final['capture'], state.actual_q)
+                if self._pending is None:
+                    self._advance(state)
         else:
             t = state.timestamp - self._seg_t0
             s = min(t / self._move_duration, 1.0)
@@ -513,7 +531,7 @@ class ScanProgram(ProgramBase):
         self.state = state
         self.state.goal_q = goal_q
 
-def preview(model, ctrl: 'ControllerBase', plan: ScanPlan, capture: Callable[[int, np.ndarray], None]) -> None:
+def preview(model, ctrl: 'ControllerBase', plan: ScanPlan, capture: Capture) -> None:
     from igmr_robotics_toolkit.viewer.core import create_simple_viewer
     from igmr_robotics_toolkit.viewer.widget import ControlledRobotWidget, TransformListWidget, LineWidget
 
@@ -543,7 +561,7 @@ def create_controller(model, config: ScanConfig, args):
     else:
         return model.Controller(args.robot, model)
 
-def execute(model, ctrl: 'ControllerBase', plan: ScanPlan, capture: Callable[[int, np.ndarray], None]) -> None:
+def execute(model, ctrl: 'ControllerBase', plan: ScanPlan, capture: Capture) -> None:
     prog = ScanProgram(plan, capture)
 
     thread = Thread(target=lambda: ctrl.run(prog), daemon=True)
@@ -617,15 +635,27 @@ def dry_run(model, plan: ScanPlan, position_tolerance: float = 1e-3,
               len(captured), plan.view_count, 1e3 * max(position_error), degrees(max(angle_error)),
               tick * dt, degrees(config.joint_speed))
 
-def make_recorder(model, plan: ScanPlan, output: Optional[Path]) -> Callable[[int, np.ndarray], None]:
-    if output is None:
+def make_recorder(model, plan: ScanPlan, rig: Optional['CameraRig'] = None,
+                  output: Optional[Path] = None, pool: Optional[ThreadPoolExecutor] = None) -> Capture:
+    if rig is None:
         def log_only(idx, q):
-            _log.info('   at %s m (not recording)',
+            _log.info('   at %s m (not capturing)',
                       np.round(model.kinematics.forward(q)[:3, 3], 4))
         return log_only
 
-    output.mkdir(parents=True, exist_ok=True)
-    _log.info('recording to %s', output)
+    _log.info('capturing to %s', output)
+
+    def capture_view(idx, entry):
+        try:
+            entry['cameras'] = rig.capture_all(output, idx)
+        except Exception as e:
+            # log and move on: a failed view must not leave the arm parked at the face
+            _log.error('view %d: capture failed: %s', idx, e)
+            entry['capture_error'] = str(e)
+        entry['one_camera_at_a_time'] = rig.sequential
+
+        with open(output / f'view_{idx:03d}.yaml', 'w') as f:
+            safe_dump(denumpy(entry), f)
 
     def record(idx, q):
         flange = model.kinematics.forward(q)
@@ -640,18 +670,20 @@ def make_recorder(model, plan: ScanPlan, output: Optional[Path]) -> Callable[[in
             planned_camera_pose=plan.camera_poses[idx],
         )
 
-        with open(output / f'view_{idx:03d}.yaml', 'w') as f:
-            safe_dump(denumpy(entry), f)
+        # the cameras are slow next to the control loop, so capture on the pool while the arm holds the view
+        return pool.submit(capture_view, idx, entry)
 
     return record
 
-def write_manifest(output: Optional[Path], plan: ScanPlan) -> None:
-    if output is None:
-        return
+def write_manifest(output: Path, plan: ScanPlan, rig: 'CameraRig') -> None:
+    output.mkdir(parents=True)
 
-    output.mkdir(parents=True, exist_ok=True)
+    # snapshot the calibration, so the scan stays usable if camera_matrix.yaml is recalibrated later
+    shutil.copy(rig.config_file, output / 'camera_matrix.yaml')
+
     with open(output / 'scan.yaml', 'w') as f:
         safe_dump(denumpy(dict(
+            experiment=output.name,
             started=datetime.now(timezone.utc).isoformat(),
             model=plan.config.model,
             path=plan.config.path.name,
@@ -659,11 +691,44 @@ def write_manifest(output: Optional[Path], plan: ScanPlan) -> None:
             path_parameters=denumpy(vars(plan.config.path)),
             face_pose=plan.config.face,
             camera_in_flange=plan.config.camera,
+            cameras={camera.name: dict(type=camera.type, serial=camera.serial) for camera in rig.cameras},
+            images=('unrotated; <cam>_color.png is aligned to depth (the calibrated IR frame, '
+                    'intrinsics in camera_matrix.yaml); <cam>_color_raw.png is unaligned; '
+                    '<cam>_depth.npy is float32 mm with 0 for no depth'),
             views=[dict(view=i, **plan.config.path.record(v))
                    for (i, v) in enumerate(plan.views)],
         )), f)
 
+def prompt_output(root: Path = OUTPUT_ROOT) -> Path:
+    '''Ask for the experiment id; its captures go to root/<MM-DD-YYYY>/<id>.'''
+    day = root / datetime.now().strftime(DATE_FORMAT)
+
+    while True:
+        try:
+            experiment = input('experiment id: ').strip()
+        except EOFError:
+            raise SystemExit('no experiment id given')
+
+        if not experiment or experiment in ('.', '..') or any(c in experiment for c in '/\\'):
+            print('experiment id must be a non-empty name without slashes')
+            continue
+
+        output = day / experiment
+        if output.exists():
+            print(f'{output} already exists, pick another experiment id')
+            continue
+
+        return output
+
 def run(args):
+    capture = args.capture
+    if capture and not args.robot:
+        _log.warning('--capture only applies on the robot; %s continues without capturing',
+                     'the simulation' if args.simulate else 'the plan-only dry run')
+        capture = False
+
+    output = prompt_output() if capture else None
+
     config = ScanConfig(path=PATHS[args.path]())
 
     # only the arm has to move at the real joint_speed; planning is purely
@@ -682,17 +747,32 @@ def run(args):
         dry_run(model, plan)
         return
 
-    controller = create_controller(model, config, args)
-    output = Path(args.output) if args.output else None
-    write_manifest(output, plan)
+    rig = None
+    if capture:
+        # only needed with --capture, so the robot-only modes run without pyrealsense2
+        from camera import CameraRig
 
-    capture = make_recorder(model, plan, output)
-    mark = monotonic()
-    if args.simulate:
-        preview(model, controller, plan, capture)
-    else:
-        execute(model, controller, plan, capture)
-    _log.info('scan finished in %.0f s', monotonic() - mark)
+        rig = CameraRig()
+        # start the cameras before connecting, so a missing camera aborts before the arm moves
+        rig.start()
+
+    try:
+        controller = create_controller(model, config, args)
+        if rig is not None:
+            write_manifest(output, plan, rig)
+
+        mark = monotonic()
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix='capture') as pool:
+            recorder = make_recorder(model, plan, rig, output, pool)
+            if args.simulate:
+                preview(model, controller, plan, recorder)
+            else:
+                execute(model, controller, plan, recorder)
+        _log.info('scan finished in %.0f s', monotonic() - mark)
+
+    finally:
+        if rig is not None:
+            rig.stop()
 
 def main():
     parser = ArgumentParser(description='Move a KUKA LBR arm around a phantom head to capture multi-view scan data for MVFace.',
@@ -710,12 +790,13 @@ def main():
                         help='scan path: "sphere" orbits the face at a constant standoff with every '
                              'view aimed at it; "plane" is a rectified grid in a vertical plane with '
                              'every view sharing one orientation')
-    parser.add_argument('--output', '-o', type=str, help='directory to record per-view data into')
+    parser.add_argument('--capture', action='store_true',
+                        help='capture every camera at each viewpoint (robot only; ignored with a warning '
+                             'under --simulate and --plan-only), asking for an experiment id and saving to '
+                             f'{OUTPUT_ROOT}/<MM-DD-YYYY>/<experiment id>')
     parser.add_argument('--verbose', '-v', action='store_true', help='log every viewpoint')
 
     args = parser.parse_args()
-    if args.plan_only and args.output:
-        parser.error('--plan-only records nothing; drop --output')
     if args.verbose:
         _log.setLevel(logging.DEBUG)
         coloredlogs.install(level=logging.DEBUG, logger=_log)
