@@ -140,7 +140,8 @@ class SpherePath(ScanPath):
 class PlanePath(ScanPath):
     name = 'plane'
     
-    distance: float = 0.30
+    # 0.30 m puts the grid corners past the arm's reach with the face 0.5 m ahead of home
+    distance: float = 0.35
     width: float = 0.36
     height: float = 0.30
 
@@ -205,8 +206,9 @@ class ScanConfig:
     # tool speed
     joint_speed: float = radians(10)
 
+    # 0.5 m ahead of the flange at home_q and 10 cm below it
     face: np.ndarray = field(default_factory=lambda: parse_xform(
-        'trans(1.182996, 0.000000, 0.202695) aa(-1.148309, -1.148309, 1.247021)'))
+        'trans(1.182996, 0.000000, 0.143969) aa(-1.148309, -1.148309, 1.247021)'))
 
     camera: np.ndarray = field(default_factory=lambda: np.eye(4))
 

@@ -23,6 +23,9 @@ class RealSense(Camera):
         import pyrealsense2 as rs
 
         ir_w, ir_h = self.resolution or (480, 270)
+        if self.type == 'd405':
+            # the D405 streams depth and color off one sensor, so they must share a resolution
+            color_size = (ir_w, ir_h)
 
         pipe = rs.pipeline()
         cfg = rs.config()
