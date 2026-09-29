@@ -9,7 +9,7 @@ _log = logging.getLogger('camera')
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CALIB = REPO_ROOT / 'src' / 'mvface' / 'assets' / 'camera_matrix.yaml'
 
-# frames discarded after opening a camera, so auto-exposure settles (1 s at 30 fps)
+# frames discarded after opening a camera, so auto-exposure settles (2 s at 15 fps)
 WARMUP_FRAMES = 30
 
 

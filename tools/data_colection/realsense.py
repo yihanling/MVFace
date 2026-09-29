@@ -9,7 +9,8 @@ from camera import Camera
 _log = logging.getLogger('realsense')
 
 COLOR_SIZE = (1280, 720)
-FPS = 30
+# 15 fps with no IR stream keeps all 7 cameras at 1280x720 within the USB hubs' bandwidth
+FPS = 15
 
 
 class RealSense(Camera):
@@ -22,16 +23,16 @@ class RealSense(Camera):
     def start(self, color_size=COLOR_SIZE, fps=FPS):
         import pyrealsense2 as rs
 
-        ir_w, ir_h = self.resolution or (480, 270)
+        depth_w, depth_h = self.resolution or (480, 270)
         if self.type == 'd405':
             # the D405 streams depth and color off one sensor, so they must share a resolution
-            color_size = (ir_w, ir_h)
+            color_size = (depth_w, depth_h)
 
         pipe = rs.pipeline()
         cfg = rs.config()
         cfg.enable_device(self.serial)
-        cfg.enable_stream(rs.stream.infrared, 1, ir_w, ir_h, rs.format.y8, fps)
-        cfg.enable_stream(rs.stream.depth, ir_w, ir_h, rs.format.z16, fps)
+        # no IR stream: depth is computed on the camera, and IR frames were never saved
+        cfg.enable_stream(rs.stream.depth, depth_w, depth_h, rs.format.z16, fps)
         cfg.enable_stream(rs.stream.color, *color_size, rs.format.bgr8, fps)
 
         profile = pipe.start(cfg)
