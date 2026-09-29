@@ -2,13 +2,11 @@
 
 Multi-view 3D facial landmark estimation from calibrated RGB-D cameras.
 
-MVFace predicts 68 3D facial landmarks for a face observed from $N$ synchronized,calibrated RGB-D views. As of Iteration 1, depth enters as a fourth input channel trained from scratch.
+MVFace predicts 68 3D facial landmarks for a face observed from $N$ synchronized, calibrated RGB-D views. As of Iteration 1, depth enters as a fourth input channel trained from scratch.
 
-The architecture is a simplified adaptation of [MVGFormer](https://github.com/XunshanMan/MVGFormer) (which is a multi-view multi-person joint pose estimation model):
-The pipeline is consisted of a ResNet-50 backbone; a 4-layer DETR-style decoder that refines a set of 3D landmark queries by projecting them into every view, sampling and self-attention, 
-then re-triangulating via a differentiable Direct Linear Transform (DLT). The full pipeline is implemented in pure PyTorch. 
+The architecture is a simplified adaptation of [MVGFormer](https://github.com/XunshanMan/MVGFormer), a multi-view multi-person joint pose estimation model. The pipeline consists of a ResNet-50 backbone and a 4-layer DETR-style decoder that refines a set of 3D landmark queries by projecting them into every view, sampling and applying self-attention, then re-triangulating via a differentiable Direct Linear Transform (DLT). The full pipeline is implemented in pure PyTorch.
 
-Iteration 1 training and testing uses custom rendered face models from [FaceScape](https://nju-3dv.github.io/projects/FaceScape/) dataset. 
+Iteration 1 training and testing uses custom-rendered face models from the [FaceScape](https://nju-3dv.github.io/projects/FaceScape/) dataset.
 
 ## Repository layout
 
@@ -42,54 +40,66 @@ pip install --upgrade pip
 pip install -e .
 ```
 
-This installs `mvface` as an editable package along with its dependencies
-(PyTorch, torchvision, NumPy, SciPy, Pillow). The default PyTorch wheel is
-CUDA-enabled; verify the GPU is visible:
+This installs `mvface` as an editable package along with its dependencies (PyTorch, torchvision, NumPy, SciPy, Pillow). The default PyTorch wheel is CUDA-enabled; verify the GPU is visible:
 
 ```bash
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-If this prints `False`, install a PyTorch build matching your CUDA version from
-<https://pytorch.org/get-started/locally/>, then re-run `pip install -e .`.
+If this prints `False`, install a PyTorch build matching your CUDA version from <https://pytorch.org/get-started/locally/>, then re-run `pip install -e .`.
 
 ### Rendering dependencies (data generation only)
 
-`pip install -e .` deliberately leaves out the rendering stack. It is only
-needed on a machine that renders FaceScape meshes into training data, never for
-training, evaluation or benchmarking. Install it with one command:
+`pip install -e .` deliberately leaves out the rendering stack. It is only needed on a machine that renders FaceScape meshes into training data, never for training, evaluation or benchmarking. Install it with one command:
 
 ```bash
 bash setup_render.sh              # into ./.venv
 bash setup_render.sh <path/venv>  # into another venv, e.g. on a cluster
 ```
 
-That installs the `[render]` extra (pyrender, trimesh, OpenCV, tqdm), then
-upgrades PyOpenGL past pyrender's stale `PyOpenGL==3.1.0` pin, then verifies the
-result with a headless textured render.
+That installs the `[render]` extra (pyrender, trimesh, OpenCV, tqdm), then upgrades PyOpenGL past pyrender's stale `PyOpenGL==3.1.0` pin, then verifies the result with a headless textured render.
 
-The upgrade is not optional. PyOpenGL 3.1.0 raises `ctypes.ArgumentError` inside
-`glGenTextures` on Python 3.14 as soon as a *textured* mesh is drawn; untextured
-geometry renders fine, so the failure only appears once rendering real meshes.
-`tools/render_views.py` refuses to start if it finds a version older than 3.1.9.
+The upgrade is not optional. PyOpenGL 3.1.0 raises `ctypes.ArgumentError` inside `glGenTextures` on Python 3.14 as soon as a *textured* mesh is drawn; untextured geometry renders fine, so the failure only appears once rendering real meshes. `tools/render_views.py` refuses to start if it finds a version older than 3.1.9.
 
-Because we install over that pin on purpose, two things are expected and are not
-errors:
+Because we install over that pin on purpose, two things are expected and are not errors:
 
-- pip prints `ERROR: pip's dependency resolver ... pyrender 0.1.45 requires
-  PyOpenGL==3.1.0` during the second pass. The install still succeeds.
-- `pip check` reports that same unsatisfied requirement for the life of the
-  environment.
+- pip prints `ERROR: pip's dependency resolver ... pyrender 0.1.45 requires PyOpenGL==3.1.0` during the second pass. The install still succeeds.
+- `pip check` reports that same unsatisfied requirement for the life of the environment.
 
-Renders run headless through EGL, so prefix render commands with
-`PYOPENGL_PLATFORM=egl`.
+Renders run headless through EGL, so prefix render commands with `PYOPENGL_PLATFORM=egl`.
+
+### Data collection (robot rig capture)
+
+`pip install -e .` also leaves out the data-collection stack. It is only needed on a machine driving the robot-mounted RealSense rig (`tools/data_colection/`), never for training, evaluation, or rendering.
+
+```bash
+pip install -e ".[data_collection]"
+```
+
+That installs OpenCV and the RealSense SDK. On Windows and Linux this resolves to the official `pyrealsense2` wheel; on macOS it resolves to `pyrealsense2-macosx` instead, a community build exposing the same API, since Intel has never shipped an official macOS wheel. No code changes are needed either way — both packages import as `pyrealsense2`.
+
+For IGMR lab, to operate the KUKA LBR Med 7 robot arm to conduct data collection via `face_scan.py`, `igmr-robotics-toolkit` is needed, install with:
+
+```bash
+pip install -e ../igmr-robotics-toolkit[all]
+```
+
+or if keeping only to th eessentials:
+
+```bash
+pip install -e ../igmr-robotics-toolkit[viewer,dds]
+```
+
+
+The `viewer` and `dds` extras are required even though they are marked optional upstream — `igmr_robotics_toolkit.robot.loader` imports both unconditionally.
+
+**macOS note:** RealSense device detection may require running under `sudo` to avoid a "failed to set power state" error. This is a known limitation of the RealSense USB driver on macOS, not specific to this project.
 
 ## Usage
 
 ### Training
 
-Training data is not included (FaceScape is license-gated). Point the trainer at a
-local dataset root via `--root`:
+Training data is not included (FaceScape is license-gated). Point the trainer at a local dataset root via `--root`:
 
 ```bash
 python tools/train.py --root <path/to/data> --epochs 60 --bs 2 --lr 5e-5

@@ -23,3 +23,6 @@ env/
 .claude/
 # Scratch / verification outputs
 scratch/
+
+# Data collection captures
+tools/data_colection/output/
