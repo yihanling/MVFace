@@ -99,10 +99,17 @@ class CameraRig:
         self.stop()
         self.sequential = True
 
-    def capture_all(self, out_dir, view_index=0):
+    def capture_all(self, out_dir, view_index=0, on_captured=None):
+        '''on_captured(name) is called after each camera saves; after a fall back it may repeat a name.'''
+        on_captured = on_captured or (lambda name: None)
+
         if not self.sequential:
             try:
-                return {camera.name: camera.capture(out_dir, view_index) for camera in self.cameras}
+                captured = {}
+                for camera in self.cameras:
+                    captured[camera.name] = camera.capture(out_dir, view_index)
+                    on_captured(camera.name)
+                return captured
             except RuntimeError as e:
                 # a starved bus often shows up as frame timeouts rather than a failed start
                 self._fall_back(e)
@@ -114,4 +121,5 @@ class CameraRig:
                 captured[camera.name] = camera.capture(out_dir, view_index, warmup=WARMUP_FRAMES)
             finally:
                 camera.stop()
+            on_captured(camera.name)
         return captured

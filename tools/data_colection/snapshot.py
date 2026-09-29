@@ -4,10 +4,12 @@ from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from datetime import datetime, timezone
 from time import sleep
 
+from tqdm import tqdm
+
 from igmr_robotics_toolkit.util.yaml import safe_dump, denumpy
 
 from camera import CameraRig, DEFAULT_CALIB
-from face_scan import prompt_output
+from face_scan import OUTPUT_ROOT, prompt_output
 
 _log = logging.getLogger('face_scan')
 
@@ -31,22 +33,30 @@ def main():
         shutil.copy(rig.config_file, output / 'camera_matrix.yaml')
 
         sleep(args.settle)
-        for idx in range(args.count):
-            if idx:
-                sleep(args.interval)
+        with tqdm(total=args.count * len(rig.cameras), desc=str(output.relative_to(OUTPUT_ROOT)),
+                  unit='image') as bar:
+            for idx in range(args.count):
+                if idx:
+                    sleep(args.interval)
 
-            entry = dict(view=idx, timestamp=datetime.now(timezone.utc).isoformat())
-            try:
-                entry['cameras'] = rig.capture_all(output, idx)
-            except Exception as e:
-                _log.error('set %d: capture failed: %s', idx, e)
-                entry['capture_error'] = str(e)
-            entry['one_camera_at_a_time'] = rig.sequential
+                # a fall back re-captures every camera, so count each camera once per set
+                done = set()
+                def captured(name):
+                    if name not in done:
+                        done.add(name)
+                        bar.update()
+                    bar.set_postfix_str(f'set {idx + 1}/{args.count}, {name}')
 
-            with open(output / f'view_{idx:03d}.yaml', 'w') as f:
-                safe_dump(denumpy(entry), f)
+                entry = dict(view=idx, timestamp=datetime.now(timezone.utc).isoformat())
+                try:
+                    entry['cameras'] = rig.capture_all(output, idx, on_captured=captured)
+                except Exception as e:
+                    _log.error('set %d: capture failed: %s', idx, e)
+                    entry['capture_error'] = str(e)
+                entry['one_camera_at_a_time'] = rig.sequential
 
-        _log.info('captured %d set(s) to %s', args.count, output)
+                with open(output / f'view_{idx:03d}.yaml', 'w') as f:
+                    safe_dump(denumpy(entry), f)
     finally:
         rig.stop()
 

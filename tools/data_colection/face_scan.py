@@ -13,6 +13,8 @@ from typing import Callable, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 import coloredlogs
+from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 import igmr_robotics_toolkit.util.default_logging
 
@@ -472,7 +474,8 @@ class ScanProgram(ProgramBase):
 
         label = move[-1]['label']
         if label:
-            _log.info(label)
+            # views are shown on the progress bar, so only list them with --verbose
+            (_log.debug if move[-1]['capture'] is not None else _log.info)(label)
 
     def _advance(self, state: 'RobotState'):
         if self._index + 1 >= len(self._moves):
@@ -638,28 +641,56 @@ def dry_run(model, plan: ScanPlan, position_tolerance: float = 1e-3,
               tick * dt, degrees(config.joint_speed))
 
 def make_recorder(model, plan: ScanPlan, rig: Optional['CameraRig'] = None,
-                  output: Optional[Path] = None, pool: Optional[ThreadPoolExecutor] = None) -> Capture:
+                  output: Optional[Path] = None, pool: Optional[ThreadPoolExecutor] = None,
+                  progress: Optional[tqdm] = None) -> Capture:
+    '''progress, if given, advances one step per view once that view is recorded.'''
+
+    def view_started(idx):
+        if progress is not None:
+            progress.set_postfix_str(f'view {idx + 1}: {plan.config.path.describe(plan.views[idx])}')
+
+    def view_done():
+        if progress is not None:
+            progress.update()
+
     if rig is None:
         def log_only(idx, q):
-            _log.info('   at %s m (not capturing)',
-                      np.round(model.kinematics.forward(q)[:3, 3], 4))
+            view_started(idx)
+            _log.debug('   at %s m (not capturing)',
+                       np.round(model.kinematics.forward(q)[:3, 3], 4))
+            view_done()
         return log_only
 
     _log.info('capturing to %s', output)
 
     def capture_view(idx, entry):
+        cameras = tqdm(total=len(rig.cameras), desc='  cameras', unit='image', leave=False, position=1,
+                       disable=progress is None)
+        # a fall back re-captures every camera, so count each camera once
+        done = set()
+
+        def captured(name):
+            if name not in done:
+                done.add(name)
+                cameras.update()
+            cameras.set_postfix_str(name)
+
         try:
-            entry['cameras'] = rig.capture_all(output, idx)
+            entry['cameras'] = rig.capture_all(output, idx, on_captured=captured)
         except Exception as e:
             # log and move on: a failed view must not leave the arm parked at the face
             _log.error('view %d: capture failed: %s', idx, e)
             entry['capture_error'] = str(e)
+        finally:
+            cameras.close()
         entry['one_camera_at_a_time'] = rig.sequential
 
         with open(output / f'view_{idx:03d}.yaml', 'w') as f:
             safe_dump(denumpy(entry), f)
+        view_done()
 
     def record(idx, q):
+        view_started(idx)
         flange = model.kinematics.forward(q)
 
         entry = dict(
@@ -764,8 +795,12 @@ def run(args):
             write_manifest(output, plan, rig)
 
         mark = monotonic()
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix='capture') as pool:
-            recorder = make_recorder(model, plan, rig, output, pool)
+        # print log lines above the progress bars instead of through them
+        loggers = [logging.getLogger(name) for name in ('face_scan', 'igmr_robotics_toolkit', 'camera', 'realsense')]
+        with logging_redirect_tqdm(loggers=loggers), \
+                tqdm(total=plan.view_count, desc=f'{config.path.name} scan', unit='view', mininterval=0.2) as progress, \
+                ThreadPoolExecutor(max_workers=1, thread_name_prefix='capture') as pool:
+            recorder = make_recorder(model, plan, rig, output, pool, progress)
             if args.simulate:
                 preview(model, controller, plan, recorder)
             else:

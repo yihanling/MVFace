@@ -30,6 +30,7 @@ render = [
 data_collection = [
     "opencv-python",
     "pyyaml",
+    "tqdm",
     "pyrealsense2; sys_platform != 'darwin'",         # official RealSense SDK wheels: Windows/Linux only
     "pyrealsense2-macosx; sys_platform == 'darwin'",  # community macOS build, same `import pyrealsense2` API
 ]
