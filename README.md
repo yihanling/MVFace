@@ -1,8 +1,6 @@
-# MVFace
+# MVFace: Multi-View RGB-D Facial Landmark Detection with Geometry-Aware Transformers 
 
-Multi-view 3D facial landmark estimation from calibrated RGB-D cameras.
-
-MVFace predicts 68 3D facial landmarks for a face observed from $N$ synchronized, calibrated RGB-D views. As of Iteration 1, depth enters as a fourth input channel trained from scratch.
+MVFace predicts 68 3D facial landmarks for a face observed from $N$ synchronized, calibrated RGB-D views. As of Iteration 1, depth enters as a fourth input channel (early fusion): the backbone starts from ImageNet-pretrained ResNet-50 weights for RGB, and the new depth filter is zero-initialized, so the network begins identical to the pretrained RGB model and learns how to use depth during training.
 
 The architecture is a simplified adaptation of [MVGFormer](https://github.com/XunshanMan/MVGFormer), a multi-view multi-person joint pose estimation model. The pipeline consists of a ResNet-50 backbone and a 4-layer DETR-style decoder that refines a set of 3D landmark queries by projecting them into every view, sampling and applying self-attention, then re-triangulating via a differentiable Direct Linear Transform (DLT). The full pipeline is implemented in pure PyTorch.
 
