@@ -783,9 +783,9 @@ def run(args):
     rig = None
     if capture:
         # only needed with --capture, so the robot-only modes run without pyrealsense2
-        from camera import CameraRig
+        from camera import CameraRig, DEFAULT_CALIB
 
-        rig = CameraRig()
+        rig = CameraRig(args.calib or DEFAULT_CALIB)
         # start the cameras before connecting, so a missing camera aborts before the arm moves
         rig.start()
 
@@ -831,6 +831,9 @@ def main():
                         help='capture every camera at each viewpoint (robot only; ignored with a warning '
                              'under --simulate and --plan-only), asking for an experiment id and saving to '
                              f'{OUTPUT_ROOT}/<MM-DD-YYYY>/<experiment id>')
+    # default None: camera.py is only imported with --capture, so the robot-only modes run without pyrealsense2
+    parser.add_argument('--calib', help='camera calibration file for --capture; each camera streams at its '
+                                        '"resolution" (default: src/mvface/assets/camera_matrix.yaml, 1280x720)')
     parser.add_argument('--verbose', '-v', action='store_true', help='log every viewpoint')
 
     args = parser.parse_args()
