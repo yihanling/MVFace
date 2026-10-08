@@ -31,6 +31,9 @@ def main():
     try:
         output.mkdir(parents=True)
         shutil.copy(rig.config_file, output / 'camera_matrix.yaml')
+        # and the fixed exposure / white balance the cameras ran with
+        if rig.settings_file is not None:
+            shutil.copy(rig.settings_file, output / 'capture_settings.yaml')
 
         sleep(args.settle)
         with tqdm(total=args.count * len(rig.cameras), desc=str(output.relative_to(OUTPUT_ROOT)),

@@ -1,0 +1,22 @@
+# Fixed imaging settings per camera for this lab's lighting, chosen by
+# tools/data_colection/tune_exposure.py (last run 2026-10-08) and applied by RealSense.start().
+# Auto exposure / white balance is turned off for the listed sensor; a camera or sensor not
+# listed stays on auto. Values are raw librealsense option values:
+#   stereo: the stereo module (on the D405 it also makes the colour image); exposure in us
+#   rgb:    the D435's separate RGB camera; exposure in 100 us steps
+# Re-run the tuning whenever the lighting or the subject's distance changes.
+#
+# Not tuned yet (on auto): d435_top and d435_below - at the 2026-10-08 tuning pose their colour
+# view did not contain the face, so re-run tune_exposure.py --only d435_top d435_below with the
+# face in view.
+cameras:
+  d405_center:
+    stereo: {exposure: 8000, gain: 16, white_balance: 3700}
+  d405_right:
+    stereo: {exposure: 10000, gain: 16, white_balance: 3300}
+  d405_left:
+    stereo: {exposure: 8000, gain: 16, white_balance: 3600}
+  d405_top_left:
+    stereo: {exposure: 10000, gain: 16, white_balance: 3100}
+  d405_top_right:
+    stereo: {exposure: 9000, gain: 16, white_balance: 3200}

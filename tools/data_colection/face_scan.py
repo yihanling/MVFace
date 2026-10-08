@@ -713,6 +713,9 @@ def write_manifest(output: Path, plan: ScanPlan, rig: 'CameraRig') -> None:
 
     # snapshot the calibration, so the scan stays usable if camera_matrix.yaml is recalibrated later
     shutil.copy(rig.config_file, output / 'camera_matrix.yaml')
+    # and the fixed exposure / white balance the cameras ran with
+    if rig.settings_file is not None:
+        shutil.copy(rig.settings_file, output / 'capture_settings.yaml')
 
     with open(output / 'scan.yaml', 'w') as f:
         safe_dump(denumpy(dict(
@@ -725,9 +728,12 @@ def write_manifest(output: Path, plan: ScanPlan, rig: 'CameraRig') -> None:
             face_pose=plan.config.face,
             camera_in_flange=plan.config.camera,
             cameras={camera.name: dict(type=camera.type, serial=camera.serial) for camera in rig.cameras},
-            images=('unrotated; <cam>_color.png is aligned to depth (the calibrated IR frame, '
-                    'intrinsics in camera_matrix.yaml); <cam>_color_raw.png is unaligned; '
-                    '<cam>_depth.npy is float32 mm with 0 for no depth'),
+            images=('unrotated; each camera fuses a burst of frames (see frames/min_valid/max_depth_mm '
+                    'in view_*.yaml): <cam>_depth.npy is float32 mm, the per-pixel median over frames '
+                    'with depth, 0 for no depth or beyond max_depth_mm; <cam>_color.png is aligned to '
+                    'depth (the calibrated IR frame, intrinsics in camera_matrix.yaml) and black where '
+                    'depth is 0; <cam>_depth_count.npy is how many frames had depth per pixel; '
+                    '<cam>_color_raw.png is one unaligned frame'),
             views=[dict(view=i, **plan.config.path.record(v))
                    for (i, v) in enumerate(plan.views)],
         )), f)

@@ -8,6 +8,8 @@ _log = logging.getLogger('camera')
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CALIB = REPO_ROOT / 'src' / 'mvface' / 'assets' / 'camera_matrix.yaml'
+# manual exposure / gain / white balance per camera
+DEFAULT_SETTINGS = REPO_ROOT / 'src' / 'mvface' / 'assets' / 'capture_settings.yaml'
 
 # frames discarded after opening a camera, so auto-exposure settles (2 s at 15 fps)
 WARMUP_FRAMES = 30
@@ -34,6 +36,8 @@ class Camera:
         self.distortion = np.asarray(distortion if distortion is not None else [0, 0, 0, 0, 0], dtype=float)
         self.resolution = tuple(resolution) if resolution is not None else None
         self.rotate = rotate
+        # per-sensor fixed imaging settings from the capture settings file; empty means auto
+        self.imaging = {}
 
     @classmethod
     def from_config(cls, name, cfg):
@@ -63,7 +67,8 @@ class Camera:
 
 
 class CameraRig:
-    def __init__(self, config_file=DEFAULT_CALIB):
+    def __init__(self, config_file=DEFAULT_CALIB, settings_file=DEFAULT_SETTINGS):
+        '''settings_file None (or missing) leaves every camera on auto exposure and white balance.'''
         self.config_file = Path(config_file)
         cfg = yaml.safe_load(open(self.config_file))
 
@@ -72,6 +77,14 @@ class CameraRig:
             raise RuntimeError(f'no cameras in {config_file}, re-check is camera_matrix complies with the default format')
 
         self.cameras = [Camera.from_config(name, c) for (name, c) in cameras.items()]
+
+        self.settings_file = Path(settings_file) if settings_file and Path(settings_file).exists() else None
+        if self.settings_file is not None:
+            settings = (yaml.safe_load(open(self.settings_file)) or {}).get('cameras') or {}
+            for camera in self.cameras:
+                camera.imaging = settings.get(camera.name) or {}
+            _log.info('fixed imaging settings from %s for %s', self.settings_file,
+                      ', '.join(c.name for c in self.cameras if c.imaging) or 'no cameras')
 
         # True once the USB bus has failed to carry every camera at once
         self.sequential = False
